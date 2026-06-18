@@ -4,8 +4,8 @@ CXXFLAGS += -fnon-call-exceptions -fasynchronous-unwind-tables -shared -fPIC
 INCLUDES = -I$(src)/include -I$(src) -I$(src)/arch/common -I$(src)/arch/x64 -I$(src)/build/release/gen/include
 INCLUDES += -I$(src)/modules/lwext4/upstream/lwext4/include -I$(src)/modules/lwext4/upstream/lwext4/build_lib_only/include
 
-integrated_vmcache_tabby: integrated_vmcache.cpp tpcc/* rte_string.hh
-	g++ $(CXXFLAGS) -DOSV $(INCLUDES) integrated_vmcache.cpp -o integrated_vmcache_tabby_eval
+integrated_vmcache_tabby: integrated_vmcache_tabby.cpp tpcc/* rte_string.hh
+	g++ $(CXXFLAGS) -DOSV $(INCLUDES) integrated_vmcache_tabby.cpp -o integrated_vmcache_tabby_eval
 
 module: integrated_vmcache_tabby
 

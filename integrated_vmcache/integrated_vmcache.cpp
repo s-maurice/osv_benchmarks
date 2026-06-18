@@ -506,6 +506,8 @@ void vmcache_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el)
                         delete bs;
                      }
                   }
+                  // could not lock shared.
+                  // leak bm?
                }else{
                   if(!vma->addEvictionCandidate(buf, bs, el)){
                      delete bs;
