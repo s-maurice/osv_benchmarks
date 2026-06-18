@@ -536,7 +536,8 @@ BufferManager::BufferManager(){
    assert(virtSize>=physSize);
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
-   ucache::createCache(physSize, envOr("BATCH", 64));
+   int prefetch_batch = envOr("PREFETCH_BATCH", envOr("BATCH", 64)); // not currently used
+   ucache::createCache(physSize, envOr("BATCH", 64), prefetch_batch);
 
    ucache::initFile("/nvme/cache", virtAllocSize);
    ucache_vma = ucache::uCacheManager->mmap("/nvme/cache", virtAllocSize, pageSize);
@@ -1510,7 +1511,8 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
       t.join();
 }
 
-int main(int argc, char** argv) {
+int benchmark_main(int argc, char** argv)
+{
    unsigned nthreads = sched::cpus.size();
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);

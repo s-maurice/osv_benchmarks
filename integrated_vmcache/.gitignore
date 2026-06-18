@@ -1,1 +1,2 @@
-integrated_vmcache_eval
+libintegrated_vmcache.a
+integrated_vmcache.o
