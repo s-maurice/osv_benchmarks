@@ -325,6 +325,30 @@ int main(int argc, char** argv)
                 osv_fs->PreOpen(tpch::kQueryFiles[query_num][i]);
         }
         printf("  [pre-open] time=%.1f ms\n", now_ms() - t_preopen);
+
+        // Pre-read all parquet files so the page directories are built and excluded
+        // from the timings. LIMIT 0 does this without scanning.
+        double t_meta = now_ms();
+        {
+            auto warm_file = [&](const char *path) {
+                duckdb::string sql = "SELECT * FROM '";
+                sql += path;
+                sql += "' LIMIT 0";
+                auto r = con.Query(sql);
+                if (r->HasError())
+                    printf("  [metadata] WARN %s: %s\n", path, r->GetError().c_str());
+            };
+            if (run_all) {
+                for (int q = 1; q <= 22; q++)
+                    for (int i = 0; tpch::kQueryFiles[q][i] != nullptr; i++)
+                        warm_file(tpch::kQueryFiles[q][i]);
+            } else {
+                for (int i = 0; tpch::kQueryFiles[query_num][i] != nullptr; i++)
+                    warm_file(tpch::kQueryFiles[query_num][i]);
+            }
+        }
+        printf("  [metadata] time=%.1f ms\n", now_ms() - t_meta);
+
         u64 phys_free  = ucache::stat_free_phys_mem();
         u64 phys_total = ucache::stat_total_phys_mem();
         u64 phys_used  = phys_total - phys_free;
