@@ -185,7 +185,15 @@ public:
     bool IsPathAbsolute(const duckdb::string &path) override;
 
     // Expose the inner filesystem for use by OpenParquetHandle.
-    duckdb::FileSystem &InnerFS() { return *inner_fs_; }
+    duckdb::FileSystem &InnerFS() override { return *inner_fs_; }
+
+    // Store a page directory for path, built by the Parquet reader after metadata
+    // load.  Idempotent: ignored if a directory for this path already exists.
+    // Returns a pointer to the (possibly pre-existing) directory.
+    PageDirectory *StorePageDirectory(const duckdb::string &path, PageDirectory dir) override;
+
+    // Return the page directory for path, or nullptr if not yet built.
+    PageDirectory *GetPageDirectory(const duckdb::string &path);
 
 private:
     static OsvUCacheFileHandle &Cast(duckdb::FileHandle &handle);
@@ -199,6 +207,8 @@ private:
     duckdb::unique_ptr<duckdb::FileSystem> inner_fs_;
 
     std::mutex vma_mu_;
+    std::unordered_map<duckdb::string, PageDirectory> page_dirs_;
+    ucache::HashTableResidentSet* duckdb_rs_ = nullptr;
 };
 
 

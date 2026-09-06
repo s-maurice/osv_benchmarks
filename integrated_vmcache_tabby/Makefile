@@ -1,5 +1,5 @@
 src = ../..
-BENCH_CXXFLAGS = -std=gnu++20 -O3 -march=znver4 -DCONF_debug_memory=0
+BENCH_CXXFLAGS = -std=gnu++20 -O3 -mavx -mavx2 -DCONF_debug_memory=0
 
 INCLUDES = -I$(src)/include -I$(src) -I$(src)/arch/common -I$(src)/arch/x64 \
 	-I$(src)/build/release.x64/gen/include

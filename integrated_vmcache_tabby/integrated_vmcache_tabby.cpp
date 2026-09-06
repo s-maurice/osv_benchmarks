@@ -242,7 +242,7 @@ struct BufferManager {
    Page* allocPage();
 };
 
-BufferManager bm;
+BufferManager* bm = nullptr;
 
 struct OLCRestartException {};
 
@@ -254,7 +254,7 @@ struct GuardO {
    static const u64 moved = ~0ull;
 
    // constructor
-   explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm.toPtr(pid))) {
+   explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm->toPtr(pid))) {
       init();
    }
 
@@ -262,7 +262,7 @@ struct GuardO {
    GuardO(u64 pid, GuardO<T2>& parent)  {
       parent.checkVersionAndRestart();
       this->pid = pid;
-      ptr = reinterpret_cast<T*>(bm.toPtr(pid));
+      ptr = reinterpret_cast<T*>(bm->toPtr(pid));
       init();
    }
 
@@ -277,12 +277,12 @@ struct GuardO {
       auto expectedVMAddress = reinterpret_cast<u64>(ptr);
 
       for (u64 repeatCounter=0; ; repeatCounter++) {
-         VMPageState& ps = bm.getPageState(pid);
+         VMPageState& ps = bm->getPageState(pid);
          auto v = ps.load();
 
          // we loaded a different page
          if (VMPageState::getVMAddress(v) != expectedVMAddress) {
-            bm.flushLocalTLB(expectedVMAddress);
+            bm->flushLocalTLB(expectedVMAddress);
             continue;
          }
 
@@ -331,7 +331,7 @@ struct GuardO {
    void checkVersionAndRestart() {
       if (pid != moved) {
          auto expectedVMAddress = reinterpret_cast<u64>(ptr);
-         VMPageState& ps = bm.getPageState(pid);
+         VMPageState& ps = bm->getPageState(pid);
          u64 stateAndVersion = ps.load();
 
          if (version == stateAndVersion) // fast path, nothing changed
@@ -385,7 +385,7 @@ struct GuardX {
 
    // constructor
    explicit GuardX(u64 pid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm.fixX(pid));
+      ptr = reinterpret_cast<T*>(bm->fixX(pid));
       ptr->dirty = true;
    }
 
@@ -395,12 +395,12 @@ struct GuardX {
       auto expectedVMAddress = reinterpret_cast<u64>(other.ptr);
 
       for (u64 repeatCounter=0; ; repeatCounter++) {
-         VMPageState& ps = bm.getPageState(other.pid);
+         VMPageState& ps = bm->getPageState(other.pid);
          auto stateAndVersion = ps.load();
 
          // we loaded a different page
          if (VMPageState::getVMAddress(stateAndVersion) != expectedVMAddress) {
-            bm.flushLocalTLB(expectedVMAddress);
+            bm->flushLocalTLB(expectedVMAddress);
             continue;
          }
 
@@ -431,7 +431,7 @@ struct GuardX {
    // move assignment operator
    GuardX& operator=(GuardX&& other) {
       if (pid != moved) {
-         bm.unfixX(pid);
+         bm->unfixX(pid);
       }
       pid = other.pid;
       ptr = other.ptr;
@@ -446,7 +446,7 @@ struct GuardX {
    // destructor
    ~GuardX() {
       if (pid != moved)
-         bm.unfixX(pid);
+         bm->unfixX(pid);
    }
 
    T* operator->() {
@@ -456,7 +456,7 @@ struct GuardX {
 
    void release() {
       if (pid != moved) {
-         bm.unfixX(pid);
+         bm->unfixX(pid);
          pid = moved;
       }
    }
@@ -467,9 +467,9 @@ struct AllocGuard : public GuardX<T> {
    template <typename ...Params>
    AllocGuard(Params&&... params) {
       // allocPage already fixes the page exclusively
-      GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPage());
+      GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage());
       new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
-      GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
+      GuardX<T>::pid = bm->toPID(GuardX<T>::ptr);
    }
 };
 
@@ -481,7 +481,7 @@ struct GuardS {
 
    // constructor
    explicit GuardS(u64 pid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm.fixS(pid));
+      ptr = reinterpret_cast<T*>(bm->fixS(pid));
    }
 
    GuardS(GuardO<T>&& other) : pid(moved) {
@@ -489,12 +489,12 @@ struct GuardS {
       auto expectedVMAddress = reinterpret_cast<u64>(other.ptr);
 
       for (u64 repeatCounter=0; ; repeatCounter++) {
-         VMPageState& ps = bm.getPageState(other.pid);
+         VMPageState& ps = bm->getPageState(other.pid);
          auto stateAndVersion = ps.load();
 
          // we loaded a different page
          if (VMPageState::getVMAddress(stateAndVersion) != expectedVMAddress) {
-            bm.flushLocalTLB(expectedVMAddress);
+            bm->flushLocalTLB(expectedVMAddress);
             continue;
          }
 
@@ -520,7 +520,7 @@ struct GuardS {
 
    GuardS(GuardS&& other) {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
       pid = other.pid;
       ptr = other.ptr;
       other.pid = moved;
@@ -533,7 +533,7 @@ struct GuardS {
    // move assignment operator
    GuardS& operator=(GuardS&& other) {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
       pid = other.pid;
       ptr = other.ptr;
       other.pid = moved;
@@ -547,7 +547,7 @@ struct GuardS {
    // destructor
    ~GuardS() {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
    }
 
    T* operator->() {
@@ -557,7 +557,7 @@ struct GuardS {
 
    void release() {
       if (pid != moved) {
-         bm.unfixS(pid);
+         bm->unfixS(pid);
          pid = moved;
       }
    }
@@ -579,7 +579,7 @@ thread_local std::vector<PID> currentEvictionDirtyLockedCandidates;
 // this callback is problematic. The dirty state may have changed.
 // We need to ensure that this thread (evicting thread) is holding a shared lock.
 bool vmcache_isDirty(ucache::Buffer* buf) {
-   auto pid = bm.toPID(buf->baseVirt);
+   auto pid = bm->toPID(buf->baseVirt);
    return std::find(currentEvictionDirtyLockedCandidates.begin(), currentEvictionDirtyLockedCandidates.end(), pid) != currentEvictionDirtyLockedCandidates.end();
 }
 
@@ -621,21 +621,21 @@ void vmcache_post_io_pre_mapped(ucache::Buffer* buf) {
 // called after buffers are written, but before tlb is flushed
 // called again after tlb is flushed
 bool vmcache_canBeEvicted(ucache::Buffer* buf) {
-   PID pid = bm.toPID(buf->baseVirt);
-   auto expectedVMAddress = reinterpret_cast<u64>(bm.toPtr(pid));
-   ucache::assert_crash(buf->baseVirt == bm.toPtr(pid));
+   PID pid = bm->toPID(buf->baseVirt);
+   auto expectedVMAddress = reinterpret_cast<u64>(bm->toPtr(pid));
+   ucache::assert_crash(buf->baseVirt == bm->toPtr(pid));
 
    // this loop doesn't yield. It can only fail if we access the wrong page.
    // this page should always be in the page table when this function is called.
    for (u64 repeatCounter=0; ; repeatCounter++) {
-      VMPageState& ps = bm.getPageState(pid);
+      VMPageState& ps = bm->getPageState(pid);
       // page access. will pull PTE into local TLB.
       // see comment below.
       auto v = ps.load();
 
       // we loaded a different page
       if (VMPageState::getVMAddress(v) != reinterpret_cast<u64>(expectedVMAddress)) {
-         bm.flushLocalTLB(expectedVMAddress);
+         bm->flushLocalTLB(expectedVMAddress);
          continue;
       }
 
@@ -679,7 +679,7 @@ bool vmcache_canBeEvicted(ucache::Buffer* buf) {
          // multiple people may have a shared lock here.
          // but reader threads should not be looking at the dirty flag.
          // if two threads are evicting at the same time, one should win the resident-set removal.
-         bm.virtMem[pid].dirty = false;
+         bm->virtMem[pid].dirty = false;
          
          // try to upgrade lock to X for dirty page candidates
          auto upgradedV = VMPageState::sameVersion(VMPageState::getVMAddress(v), VMPageState::getVersion(v), VMPageState::Locked);
@@ -716,18 +716,18 @@ void vmcache_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el)
          }
          ucache::assert_crash(vma->isValidPtr(buf->baseVirt));
          ucache::BufferSnapshot* bs;
-         PID pid = bm.toPID(buf->baseVirt);
+         PID pid = bm->toPID(buf->baseVirt);
 
          // since the buffer was in the resident set, we know it's in memory
-         VMPageState& ps = bm.getPageState(pid);
+         VMPageState& ps = bm->getPageState(pid);
          auto v = ps.load();
 
-         auto expectedVMAddress = reinterpret_cast<u64>(bm.toPtr(pid));
-         ucache::assert_crash(buf->baseVirt == bm.toPtr(pid));
+         auto expectedVMAddress = reinterpret_cast<u64>(bm->toPtr(pid));
+         ucache::assert_crash(buf->baseVirt == bm->toPtr(pid));
 
          // we loaded a different page
          if (VMPageState::getVMAddress(v) != expectedVMAddress) [[unlikely]] {
-            bm.flushLocalTLB(expectedVMAddress);
+            bm->flushLocalTLB(expectedVMAddress);
             // theoretically we could continue with this page after flushing
             // cerr << "saw wrong page addr during eviction\n";
             continue;
@@ -738,16 +738,16 @@ void vmcache_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el)
          // find candidates, lock dirty ones in shared mode
          switch (VMPageState::getState(v)) {
             case VMPageState::Marked:
-               bs = new ucache::BufferSnapshot(bm.ucache_vma->nbPages);
+               bs = new ucache::BufferSnapshot(bm->ucache_vma->nbPages);
                buf->updateSnapshot(bs);
-               if(bm.virtMem[pid].dirty) {
+               if(bm->virtMem[pid].dirty) {
                   if(ps.tryLockS(v)) {
                      if(vma->addEvictionCandidate(buf, bs, el)) {
                         // locked. remember this.
                         currentEvictionDirtyLockedCandidates.emplace_back(pid);
                      } else {
                         // failed. cleanup.
-                        bm.getPageState(pid).unlockS();
+                        bm->getPageState(pid).unlockS();
                         delete bs;
                      }
                   } else {
@@ -774,7 +774,7 @@ void vmcache_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el)
 // // AND after the PTE is cleared.
 // void vmcache_release_evicted(ucache::Buffer* buf){
 //    // this will re-fault in the page to unlock it.
-//    bm.getPageState(bm.toPID(buf->baseVirt)).unlockXEvicted();
+//    bm->getPageState(bm->toPID(buf->baseVirt)).unlockXEvicted();
 // }
 
 // called in Buffer::EvictingToCached. This occurs when we fail to evict.
@@ -783,14 +783,14 @@ void vmcache_release_evicted(ucache::Buffer* buf) {
    // clean pages would not be locked.
    // dirty pages have a shared lock.
 
-   PID pid = bm.toPID(buf->baseVirt);
-   auto expectedVMAddress = bm.toPtr(pid);
+   PID pid = bm->toPID(buf->baseVirt);
+   auto expectedVMAddress = bm->toPtr(pid);
    ucache::assert_crash(buf->baseVirt == expectedVMAddress);
 
    // free the shared lock for dirty pages.
    bool isDirtyCandidate = std::find(currentEvictionDirtyLockedCandidates.begin(), currentEvictionDirtyLockedCandidates.end(), pid) != currentEvictionDirtyLockedCandidates.end();
    if (isDirtyCandidate) {
-      VMPageState& ps = bm.getPageState(pid);
+      VMPageState& ps = bm->getPageState(pid);
       auto v = ps.load(); 
 
       // we may need to use a retry loop here.
@@ -813,7 +813,7 @@ BufferManager::BufferManager() {
 
    ucache::initFile("/nvme/cache", virtAllocSize);
 
-   ucache::VMAOptions vma_options = { .skipTLBShootdown = true, .isolatedPhysicalPagePool = true, .isolatedPhysicalPagePoolSize = physSize };
+   ucache::VMAOptions vma_options = { .skipTLBShootdown = true, .framePool = std::make_shared<ucache::FramePoolAllocator>(physSize) };
 
    ucache_vma = ucache::uCacheManager->mmap("/nvme/cache", virtAllocSize, pageSize, NULL, &vma_options);
    virtMem = (Page*)ucache_vma->start;
@@ -823,7 +823,7 @@ BufferManager::BufferManager() {
                         invalidDecompressed >= reinterpret_cast<u64>(virtMem + virtCount));
    ucache_vma->callback_implems.isDirty_implem = vmcache_isDirty;
    ucache_vma->callback_implems.clearDirty_implem = vmcache_clearDirty;
-   ucache_vma->callback_implems.evict_pol = vmcache_evict_policy;
+   ucache::uCacheManager->setEvictionPolicy(ucache_vma, vmcache_evict_policy);
    ucache_vma->callback_implems.canBeEvicted_implem = vmcache_canBeEvicted;
    ucache_vma->callback_implems.post_io_pre_mapped_callback_implem = vmcache_post_io_pre_mapped;
 
@@ -885,7 +885,7 @@ Page* BufferManager::fixX(PID pid) {
 
       // we loaded a different page
       if (VMPageState::getVMAddress(stateAndVersion) != expectedVMAddress) {
-         bm.flushLocalTLB(expectedVMAddress);
+         bm->flushLocalTLB(expectedVMAddress);
          continue;
       }
 
@@ -914,7 +914,7 @@ Page* BufferManager::fixS(PID pid) {
 
       // we loaded a different page
       if (VMPageState::getVMAddress(stateAndVersion) != expectedVMAddress) {
-         bm.flushLocalTLB(expectedVMAddress);
+         bm->flushLocalTLB(expectedVMAddress);
          continue;
       }
 
@@ -961,7 +961,7 @@ struct BTreeNodeHeader {
 
    // Raw storage instead of VMPageState: placement new on char[] is a no-op (trivial type,
    // no constructor called), so the lock state set by allocPage() is preserved across
-   // BTreeNode construction. Accessed exclusively via bm.getPageState(pid).
+   // BTreeNode construction. Accessed exclusively via bm->getPageState(pid).
    alignas(VMPageState) char _state[sizeof(VMPageState)];
    bool dirty;
 
@@ -1226,7 +1226,7 @@ struct BTreeNode : public BTreeNodeHeader {
          return false;
       copyKeyValueRange(&tmp, 0, 0, count);
       right->copyKeyValueRange(&tmp, count, 0, right->count);
-      PID pid = bm.toPID(this);
+      PID pid = bm->toPID(this);
       custom_memcpy(parent->getPayload(slotId+1).data(), &pid, sizeof(PID));
       parent->removeSlot(slotId);
       tmp.makeHint();
@@ -1320,7 +1320,7 @@ struct BTreeNode : public BTreeNodeHeader {
       nodeLeft->setFences(getLowerFence(), sep);
       nodeRight->setFences(sep, getUpperFence());
 
-      PID leftPID = bm.toPID(this);
+      PID leftPID = bm->toPID(this);
       u16 oldParentSlot = parent->lowerBound(sep);
       if (oldParentSlot == parent->count) {
          ucache::assert_crash(parent->upperInnerNode == leftPID);
@@ -1631,8 +1631,8 @@ void BTree::insert(span<u8> key, span<u8> payload)
             parent = move(node);
             node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
          }
-         ucache::assert_crash(bm.isValidPID(parent.pid));
-         ucache::assert_crash(bm.isValidPID(node.pid));
+         ucache::assert_crash(bm->isValidPID(parent.pid));
+         ucache::assert_crash(bm->isValidPID(node.pid));
          if (node->hasSpaceFor(key.size(), payload.size())) {
             // only lock leaf
             GuardX<BTreeNode> nodeLocked(move(node));
@@ -1823,6 +1823,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 
 int benchmark_main(int argc, char** argv)
 {
+   bm = new BufferManager();
    unsigned nthreads = sched::cpus.size();
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
@@ -1864,7 +1865,7 @@ int benchmark_main(int argc, char** argv)
             }
          });
       }
-      cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+      cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
 
       ucache::uCacheManager->readSize = 0;
       ucache::uCacheManager->writeSize = 0;
@@ -1897,7 +1898,7 @@ int benchmark_main(int argc, char** argv)
       });
 
       statThread.join();
-      bm.ucache_vma->file->close();
+      bm->ucache_vma->file->close();
       return 0;
    }
 
@@ -1932,7 +1933,7 @@ int benchmark_main(int argc, char** argv)
          }
       });
    }
-   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+   cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
    ucache::uCacheManager->readSize = 0;
    ucache::uCacheManager->writeSize = 0;
    thread statThread(statFn);
@@ -1956,7 +1957,7 @@ int benchmark_main(int argc, char** argv)
    });
 
    statThread.join();
-   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
-   bm.ucache_vma->file->close();
+   cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
+   bm->ucache_vma->file->close();
    return 0;
 }

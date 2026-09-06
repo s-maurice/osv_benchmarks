@@ -8,11 +8,13 @@
 
 #include <cstring>
 #include <algorithm>
+#include <numeric>
+#include <numeric>
 
 namespace osv_duckdb {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// enqueue_prefetch — called by OsvCachingFileHandle::RegisterPrefetch()
+// enqueue_prefetch - called by OsvCachingFileHandle::RegisterPrefetch()
 //
 // DuckDB already knows which byte ranges it will need next; this function
 // immediately issues async NVMe IO for all pages in [pos, pos+len) that are
@@ -46,7 +48,7 @@ void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len) {
     u64 max_new = batch_cap - total_inflight;
 
     duckdb::idx_t first = pos / vma->pageSize;
-    duckdb::idx_t last  = (pos + len - 1) / vma->pageSize;
+    duckdb::idx_t last = (pos + len - 1) / vma->pageSize;
 
     std::vector<ucache::Buffer *> pl;
     for (duckdb::idx_t i = first; i <= last && i < (duckdb::idx_t)vma->buffers.size(); i++) {
@@ -63,6 +65,194 @@ void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len) {
     }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Eviction callbacks for DuckDB VMA
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el) {
+    auto* dir = static_cast<PageDirectory*>(vma->options.user_data);
+    if (!dir) return;
+
+    for (auto& pe : dir->pages) {
+        if ((u64)el.size() >= nbToEvict) break;
+
+        u64 v = pe.lock.load();
+        u64 s = PageState::getState(v);
+
+        if (s >= 1 && s <= PageState::MaxShared) continue;         // pinned by a reader
+        if (s == PageState::Locked || s == PageState::Evicted) continue;
+
+        if (s == PageState::Unlocked) {
+            pe.lock.tryMark(v);                                     // second chance
+            continue;
+        }
+
+        assert(s == PageState::Marked);
+
+        // Straddling frames belong to two pages. For now, we only evict "inner"
+        // (non-straddling) frames.
+        u64 page_end = pe.offset + (u64)pe.page_size();
+        u64 first = pe.offset / vma->pageSize;
+        u64 last = (page_end - 1) / vma->pageSize;
+        u64 inner_first = (pe.offset % vma->pageSize == 0) ? first : first + 1;
+        u64 inner_end = (page_end % vma->pageSize == 0) ? last + 1 : last;   // exclusive
+        if (inner_first >= inner_end) continue;
+
+        if (!pe.lock.tryLockX(v)) continue;                        // lost race - skip
+
+        bool any = false;
+        for (u64 i = inner_first; i < inner_end && i < vma->buffers.size(); i++) {
+            if ((u64)el.size() >= nbToEvict) break;
+            ucache::Buffer* buf = vma->buffers[i];
+            auto* bs = new ucache::BufferSnapshot(vma->nbPages);
+            buf->updateSnapshot(bs);
+            if (vma->addEvictionCandidate(buf, bs, el))
+                any = true;
+            else
+                delete bs;
+        }
+
+        if (!any)
+            pe.lock.unlockXSameVersion(v);
+        // Otherwise post_EvictedBatch releases the lock after the buffers are evicted.
+    }
+}
+
+static bool duckdb_canBeEvicted(ucache::Buffer* /*buf*/) {
+    return true;
+}
+
+static void duckdb_postEvictedBatch(ucache::Buffer* const* buffers, size_t count) {
+    auto* dir = static_cast<PageDirectory*>(buffers[0]->vma->options.user_data);
+    if (!dir) return;
+
+    u32 last_pi = UINT32_MAX;
+    for (size_t i = 0; i < count; i++) {
+        u64 buf_start = (u64)buffers[i]->baseVirt - (u64)buffers[i]->vma->start;
+        u64 buf_end = buf_start + buffers[i]->vma->pageSize;
+
+        auto it = std::lower_bound(dir->offset_index.begin(), dir->offset_index.end(), buf_start,
+            [&](u32 idx, u64 val) {
+                return dir->pages[idx].offset + (u64)dir->pages[idx].page_size() <= val;
+            });
+        if (it == dir->offset_index.end()) continue;
+        u32 pi = *it;
+        if (dir->pages[pi].offset >= buf_end) continue;
+        if (pi == last_pi) continue;
+        last_pi = pi;
+
+        PageEntry& pe = dir->pages[pi];
+        u64 v = pe.lock.load();
+        assert(PageState::getState(v) == PageState::Locked);
+        u64 new_v = PageState::nextVersion(v, PageState::Unlocked);
+        bool ok = pe.lock.stateAndVersion.compare_exchange_strong(v, new_v);
+        assert(ok);
+        // Optimisations: skip the redundant version check and TLB flush that
+        // lockSWithFlush/validateFlushTlb would otherwise fire on this CPU's
+        // next read of the page.
+        dir->thread_versions[GetThreadSlot()][pi] = new_v;
+        // {
+        //     static constexpr uintptr_t k = 4096;
+        //     const char* base = static_cast<const char*>(buffers[i]->vma->start);
+        //     uintptr_t start  = reinterpret_cast<uintptr_t>(base + pe.offset) & ~(k - 1);
+        //     uintptr_t end    = reinterpret_cast<uintptr_t>(base + pe.offset + (u64)pe.page_size());
+        //     std::vector<void*> flush_pages;
+        //     flush_pages.reserve((end - start + k - 1) / k);
+        //     for (uintptr_t p = start; p < end; p += k)
+        //         flush_pages.push_back(reinterpret_cast<void*>(p));
+        //     mmu::invlpg_tlb_local(flush_pages.data(), flush_pages.size());
+        // }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Page directory persistence
+// ─────────────────────────────────────────────────────────────────────────────
+
+size_t GetThreadSlot() {
+    return static_cast<size_t>(sched::cpu::current()->id);
+}
+
+void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size) {
+    std::vector<void *> flush_pages;
+    auto make_flush_pages = [&]() -> std::vector<void *> & {
+        if (flush_pages.empty()) {
+            static constexpr u64 k = 4096;
+            uintptr_t start = reinterpret_cast<uintptr_t>(page_addr) & ~(k - 1);
+            uintptr_t end = reinterpret_cast<uintptr_t>(page_addr) + page_size;
+            flush_pages.reserve((end - start + k - 1) / k);
+            for (uintptr_t p = start; p < end; p += k)
+                flush_pages.push_back(reinterpret_cast<void *>(p));
+        }
+        return flush_pages;
+    };
+
+    for (;;) {
+        u64 v = ps.load();
+        u64 s = PageState::getState(v);
+        if (s == PageState::Locked || s == PageState::Evicted) {
+            _mm_pause();
+            continue;
+        }
+        if (PageState::getVersion(v) != PageState::getVersion(local_version)) {
+            auto &pages = make_flush_pages();
+            mmu::invlpg_tlb_local(pages.data(), pages.size());
+            local_version = v;
+        }
+        if (ps.tryLockS(v)) {
+            local_version = v;
+            return;
+        }
+        _mm_pause();
+    }
+}
+
+void validateFlushTlb(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size) {
+    if (ps.validateRead(local_version)) return;
+    static constexpr u64 k = 4096;
+    uintptr_t start = reinterpret_cast<uintptr_t>(page_addr) & ~(k - 1);
+    uintptr_t end = reinterpret_cast<uintptr_t>(page_addr) + page_size;
+    std::vector<void *> pages;
+    pages.reserve((end - start + k - 1) / k);
+    for (uintptr_t p = start; p < end; p += k)
+        pages.push_back(reinterpret_cast<void *>(p));
+    mmu::invlpg_tlb_local(pages.data(), pages.size());
+    local_version = ps.beginRead();
+}
+
+PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &path,
+                                                        PageDirectory dir) {
+    std::lock_guard<std::mutex> lk(vma_mu_);
+    auto it = page_dirs_.find(path);
+    if (it != page_dirs_.end())
+        return &it->second;
+    size_t num_cpus = sched::cpus.size();
+    size_t num_pages = dir.pages.size();
+    dir.thread_versions.assign(num_cpus, std::vector<u64>(num_pages, PageState::NO_VERSION));
+
+    dir.offset_index.resize(num_pages);
+    std::iota(dir.offset_index.begin(), dir.offset_index.end(), 0u);
+    std::sort(dir.offset_index.begin(), dir.offset_index.end(),
+        [&](u32 a, u32 b) { return dir.pages[a].offset < dir.pages[b].offset; });
+
+    auto [ins, _] = page_dirs_.emplace(path, std::move(dir));
+    PageDirectory &dir_ref = ins->second;
+
+    ucache::VMA *vma = ucache::uCacheManager->mmap(path.c_str(), 0, mmu::page_size);
+    vma->options.user_data = &dir_ref;
+    ucache::uCacheManager->setEvictionPolicy(vma, duckdb_evict_policy);
+    vma->callback_implems.canBeEvicted_implem = duckdb_canBeEvicted;
+    vma->callback_implems.post_EvictedBatch_callback_implem = duckdb_postEvictedBatch;
+
+    return &dir_ref;
+}
+
+PageDirectory *OsvUCacheFileSystem::GetPageDirectory(const duckdb::string &path) {
+    std::lock_guard<std::mutex> lk(vma_mu_);
+    auto it = page_dirs_.find(path);
+    return it != page_dirs_.end() ? &it->second : nullptr;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
@@ -88,12 +278,18 @@ ucache::VMA *OsvUCacheFileSystem::GetOrCreateVMA(
 
     ucache::VMA *vma = ucache::uCacheManager->mmap(
         path.c_str(), file_size, mmu::page_size, nullptr);
+    if (duckdb_rs_ == nullptr)
+        duckdb_rs_ = new ucache::HashTableResidentSet(
+            ucache::uCacheManager->totalPhysSize / mmu::page_size);
+    if (vma->residentSet == ucache::uCacheManager->globalResidentSet)
+        vma->residentSet = duckdb_rs_;
+    vma->options.skipTLBShootdown = true;
     return vma;
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OsvUCacheFileSystem — file open
+// OsvUCacheFileSystem - file open
 // ─────────────────────────────────────────────────────────────────────────────
 
 duckdb::unique_ptr<duckdb::FileHandle>
@@ -103,7 +299,7 @@ OsvUCacheFileSystem::OpenFile(const duckdb::string &path,
 {
     if (ucache::uCacheManager == nullptr || ucache::uCacheManager->totalPhysSize == 0) {
         throw duckdb::IOException(
-            "OsvUCacheFileSystem: cache not initialised — call osv_ucache_init() first");
+            "OsvUCacheFileSystem: cache not initialised - call osv_ucache_init() first");
     }
 
     std::lock_guard<std::mutex> lk(vma_mu_);
@@ -123,7 +319,7 @@ OsvUCacheFileSystem::OpenParquetHandle(
 {
     if (ucache::uCacheManager == nullptr || ucache::uCacheManager->totalPhysSize == 0) {
         throw duckdb::IOException(
-            "OsvUCacheFileSystem: cache not initialised — call osv_ucache_init() first");
+            "OsvUCacheFileSystem: cache not initialised - call osv_ucache_init() first");
     }
 
     std::lock_guard<std::mutex> lk(vma_mu_);
@@ -132,9 +328,15 @@ OsvUCacheFileSystem::OpenParquetHandle(
     auto inner_handle = inner_fs_->OpenFile(path, flags, opener);
     u64 file_size = static_cast<u64>(vma->file->size);
 
-    return duckdb::make_uniq<OsvCachingFileHandle>(
+    auto handle = duckdb::make_uniq<OsvCachingFileHandle>(
         vma, static_cast<const char *>(vma->start),
         file_size, path, std::move(inner_handle), *this);
+
+    auto dir_it = page_dirs_.find(path);
+    if (dir_it != page_dirs_.end())
+        handle->page_dir = &dir_it->second;
+
+    return handle;
 }
 
 

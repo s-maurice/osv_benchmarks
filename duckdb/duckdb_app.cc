@@ -23,7 +23,7 @@
  *                               (default: 80% of UCACHE_MEM on OSv,
  *                                or 40% of total RAM on Linux)
  *   DUCKDB_FILE_CACHE=<size|0>  DuckDB external file cache cap.
- *                               OSv default: 0 (disabled — uCache handles I/O).
+ *                               OSv default: 0 (disabled - uCache handles I/O).
  *                               Linux default: unset (enabled, no cap).
  *                               A non-zero size enables the cache and limits it
  *                               to that many bytes; the amount is added on top
@@ -91,7 +91,7 @@ static double run_query(duckdb::Connection &con, int qnum) {
     printf("\n=== TPC-H Q%02d ===\n", qnum);
 
 #ifdef __OSV__
-    // Pre-query snapshot as initial baseline.
+    ucache::reset_io_stats();
     u64 peak_used;
     size_t min_hugeblk;
     {
@@ -148,6 +148,10 @@ static double run_query(duckdb::Connection &con, int qnum) {
     }
 #endif
     printf("\n");
+    // TPCH_PRINT=1 dumps result rows
+    if (getenv("TPCH_PRINT")) {
+        printf("%s", result->ToString().c_str());
+    }
 #ifdef __OSV__
     ucache::print_llfree_stats();
     ucache::print_stats();
@@ -225,8 +229,8 @@ int main(int argc, char** argv)
            duckdb_mem / (1024.0 * 1024 * 1024));
 
     // DUCKDB_FILE_CACHE:
-    //   OSv default — disabled (uCache is the I/O cache, no redundant copy needed).
-    //   Linux default — enabled, no cap (DuckDB's CachingFileSystem is the cache).
+    //   OSv default - disabled (uCache is the I/O cache, no redundant copy needed).
+    //   Linux default - enabled, no cap (DuckDB's CachingFileSystem is the cache).
     //   0 / "off"   → disable on either platform.
     //   <size>      → enable with that byte cap; added to max_memory.
     const char *file_cache_env = getenv("DUCKDB_FILE_CACHE");
@@ -308,7 +312,7 @@ int main(int argc, char** argv)
 
 #ifdef __OSV__
     // Pre-open uCache VMAs for all files the selected queries will access.
-    // mmap() is idempotent — subsequent DuckDB opens return the existing VMA.
+    // mmap() is idempotent - subsequent DuckDB opens return the existing VMA.
     // This isolates VMA creation time from the timed query execution below.
     {
         double t_preopen = now_ms();

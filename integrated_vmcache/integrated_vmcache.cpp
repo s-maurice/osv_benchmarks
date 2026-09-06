@@ -178,7 +178,7 @@ struct BufferManager {
    Page* allocPage();
 };
 
-BufferManager bm;
+BufferManager* bm = nullptr;
 
 struct OLCRestartException {};
 
@@ -190,7 +190,7 @@ struct GuardO {
    static const u64 moved = ~0ull;
 
    // constructor
-   explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm.toPtr(pid))) {
+   explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm->toPtr(pid))) {
       init();
    }
 
@@ -198,7 +198,7 @@ struct GuardO {
    GuardO(u64 pid, GuardO<T2>& parent)  {
       parent.checkVersionAndRestart();
       this->pid = pid;
-      ptr = reinterpret_cast<T*>(bm.toPtr(pid));
+      ptr = reinterpret_cast<T*>(bm->toPtr(pid));
       init();
    }
 
@@ -210,7 +210,7 @@ struct GuardO {
 
    void init() {
       assert(pid != moved);
-      PageState& ps = bm.getPageState(pid);
+      PageState& ps = bm->getPageState(pid);
       for (u64 repeatCounter=0; ; repeatCounter++) {
          u64 v = ps.stateAndVersion.load();
          switch (PageState::getState(v)) {
@@ -226,8 +226,8 @@ struct GuardO {
                break;
             case PageState::Evicted:
                if(ps.tryLockX(v)){
-                  bm.handleFault(pid);
-                  bm.unfixX(pid);
+                  bm->handleFault(pid);
+                  bm->unfixX(pid);
                }
                break;
             default:
@@ -258,7 +258,7 @@ struct GuardO {
 
    void checkVersionAndRestart() {
       if (pid != moved) {
-         PageState& ps = bm.getPageState(pid);
+         PageState& ps = bm->getPageState(pid);
          u64 stateAndVersion = ps.stateAndVersion.load();
          if (version == stateAndVersion) // fast path, nothing changed
             return;
@@ -303,13 +303,13 @@ struct GuardX {
 
    // constructor
    explicit GuardX(u64 pid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm.fixX(pid));
+      ptr = reinterpret_cast<T*>(bm->fixX(pid));
       ptr->dirty = true;
    }
    explicit GuardX(GuardO<T>&& other) {
       ucache::assert_crash(other.pid != moved);
       for (u64 repeatCounter=0; ; repeatCounter++) {
-         PageState& ps = bm.getPageState(other.pid);
+         PageState& ps = bm->getPageState(other.pid);
          u64 stateAndVersion = ps.stateAndVersion;
          if ((stateAndVersion<<8) != (other.version<<8))
             throw OLCRestartException();
@@ -333,7 +333,7 @@ struct GuardX {
    // move assignment operator
    GuardX& operator=(GuardX&& other) {
       if (pid != moved) {
-         bm.unfixX(pid);
+         bm->unfixX(pid);
       }
       pid = other.pid;
       ptr = other.ptr;
@@ -348,7 +348,7 @@ struct GuardX {
    // destructor
    ~GuardX() {
       if (pid != moved)
-         bm.unfixX(pid);
+         bm->unfixX(pid);
    }
 
    T* operator->() {
@@ -358,7 +358,7 @@ struct GuardX {
 
    void release() {
       if (pid != moved) {
-         bm.unfixX(pid);
+         bm->unfixX(pid);
          pid = moved;
       }
    }
@@ -368,9 +368,9 @@ template<class T>
 struct AllocGuard : public GuardX<T> {
    template <typename ...Params>
    AllocGuard(Params&&... params) {
-      GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPage());
+      GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage());
       new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
-      GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
+      GuardX<T>::pid = bm->toPID(GuardX<T>::ptr);
    }
 };
 
@@ -382,12 +382,12 @@ struct GuardS {
 
    // constructor
    explicit GuardS(u64 pid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm.fixS(pid));
+      ptr = reinterpret_cast<T*>(bm->fixS(pid));
    }
 
    GuardS(GuardO<T>&& other) {
       assert(other.pid != moved);
-      if (bm.getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
+      if (bm->getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
          pid = other.pid;
          ptr = other.ptr;
          other.pid = moved;
@@ -399,7 +399,7 @@ struct GuardS {
 
    GuardS(GuardS&& other) {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
       pid = other.pid;
       ptr = other.ptr;
       other.pid = moved;
@@ -412,7 +412,7 @@ struct GuardS {
    // move assignment operator
    GuardS& operator=(GuardS&& other) {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
       pid = other.pid;
       ptr = other.ptr;
       other.pid = moved;
@@ -426,7 +426,7 @@ struct GuardS {
    // destructor
    ~GuardS() {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
    }
 
    T* operator->() {
@@ -436,7 +436,7 @@ struct GuardS {
 
    void release() {
       if (pid != moved) {
-         bm.unfixS(pid);
+         bm->unfixS(pid);
          pid = moved;
       }
    }
@@ -449,14 +449,14 @@ u64 envOr(const char* env, u64 value) {
 }
 
 bool vmcache_isDirty(ucache::Buffer* buf){
-   return bm.virtMem[bm.toPID(buf->baseVirt)].dirty;
+   return bm->virtMem[bm->toPID(buf->baseVirt)].dirty;
 }
 
 void vmcache_clearDirty(ucache::Buffer* buf){}
 
 bool vmcache_canBeEvicted(ucache::Buffer* buf){
-   PID pid = bm.toPID(buf->baseVirt);
-   PageState& ps = bm.getPageState(pid);
+   PID pid = bm->toPID(buf->baseVirt);
+   PageState& ps = bm->getPageState(pid);
    u64 v = ps.stateAndVersion;
    if(PageState::getState(v) == PageState::Marked){ // clean candidate
       if(ps.tryLockX(v)){
@@ -464,8 +464,8 @@ bool vmcache_canBeEvicted(ucache::Buffer* buf){
       }else
          return false;
    }
-   if(bm.virtMem[bm.toPID(buf->baseVirt)].dirty){ // has been written
-      bm.virtMem[bm.toPID(buf->baseVirt)].dirty = false;
+   if(bm->virtMem[bm->toPID(buf->baseVirt)].dirty){ // has been written
+      bm->virtMem[bm->toPID(buf->baseVirt)].dirty = false;
       if((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked))){
          return true;
       }else{
@@ -473,7 +473,7 @@ bool vmcache_canBeEvicted(ucache::Buffer* buf){
       }
    }
    if(PageState::getState(v) == PageState::Locked){
-      ucache::assert_crash(bm.virtMem[bm.toPID(buf->baseVirt)].dirty == false);
+      ucache::assert_crash(bm->virtMem[bm->toPID(buf->baseVirt)].dirty == false);
       return true;
    }
    return false;
@@ -492,17 +492,17 @@ void vmcache_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el)
          }
          ucache::assert_crash(vma->isValidPtr(buf->baseVirt));
          ucache::BufferSnapshot* bs;
-         PID pid = bm.toPID(buf->baseVirt);
-         PageState& ps = bm.getPageState(pid);
+         PID pid = bm->toPID(buf->baseVirt);
+         PageState& ps = bm->getPageState(pid);
          u64 v = ps.stateAndVersion;
          switch (PageState::getState(v)) {
             case PageState::Marked:
-               bs = new ucache::BufferSnapshot(bm.ucache_vma->nbPages);
+               bs = new ucache::BufferSnapshot(bm->ucache_vma->nbPages);
                buf->updateSnapshot(bs);
-               if(bm.virtMem[pid].dirty){
+               if(bm->virtMem[pid].dirty){
                   if(ps.tryLockS(v)){
                      if(!vma->addEvictionCandidate(buf, bs, el)){
-                        bm.getPageState(pid).unlockS();
+                        bm->getPageState(pid).unlockS();
                         delete bs;
                      }
                   }
@@ -525,7 +525,7 @@ void vmcache_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el)
 }
 
 void vmcache_release_evicted(ucache::Buffer* buf){
-   bm.getPageState(bm.toPID(buf->baseVirt)).unlockXEvicted();
+   bm->getPageState(bm->toPID(buf->baseVirt)).unlockXEvicted();
 }
 
 
@@ -544,7 +544,7 @@ BufferManager::BufferManager(){
    virtMem = (Page*)ucache_vma->start;
    ucache_vma->callback_implems.isDirty_implem = vmcache_isDirty;
    ucache_vma->callback_implems.clearDirty_implem = vmcache_clearDirty;
-   ucache_vma->callback_implems.evict_pol = vmcache_evict_policy;
+   ucache::uCacheManager->setEvictionPolicy(ucache_vma, vmcache_evict_policy);
    ucache_vma->callback_implems.canBeEvicted_implem = vmcache_canBeEvicted;
    ucache_vma->callback_implems.post_EvictingToUncached_callback_implem = vmcache_release_evicted;
 
@@ -907,7 +907,7 @@ struct BTreeNode : public BTreeNodeHeader {
          return false;
       copyKeyValueRange(&tmp, 0, 0, count);
       right->copyKeyValueRange(&tmp, count, 0, right->count);
-      PID pid = bm.toPID(this);
+      PID pid = bm->toPID(this);
       custom_memcpy(parent->getPayload(slotId+1).data(), &pid, sizeof(PID));
       parent->removeSlot(slotId);
       tmp.makeHint();
@@ -1001,7 +1001,7 @@ struct BTreeNode : public BTreeNodeHeader {
       nodeLeft->setFences(getLowerFence(), sep);
       nodeRight->setFences(sep, getUpperFence());
 
-      PID leftPID = bm.toPID(this);
+      PID leftPID = bm->toPID(this);
       u16 oldParentSlot = parent->lowerBound(sep);
       if (oldParentSlot == parent->count) {
          assert(parent->upperInnerNode == leftPID);
@@ -1321,8 +1321,8 @@ void BTree::insert(span<u8> key, span<u8> payload)
             parent = move(node);
             node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
          }
-         ucache::assert_crash(bm.isValidPID(parent.pid));
-         ucache::assert_crash(bm.isValidPID(node.pid));
+         ucache::assert_crash(bm->isValidPID(parent.pid));
+         ucache::assert_crash(bm->isValidPID(node.pid));
          if (node->hasSpaceFor(key.size(), payload.size())) {
             // only lock leaf
             GuardX<BTreeNode> nodeLocked(move(node));
@@ -1513,6 +1513,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 
 int benchmark_main(int argc, char** argv)
 {
+   bm = new BufferManager();
    unsigned nthreads = sched::cpus.size();
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
@@ -1554,7 +1555,7 @@ int benchmark_main(int argc, char** argv)
             }
          });
       }
-      cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+      cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
 
       ucache::uCacheManager->readSize = 0;
       ucache::uCacheManager->writeSize = 0;
@@ -1587,7 +1588,7 @@ int benchmark_main(int argc, char** argv)
       });
 
       statThread.join();
-      bm.ucache_vma->file->close();
+      bm->ucache_vma->file->close();
       return 0;
    }
 
@@ -1622,7 +1623,7 @@ int benchmark_main(int argc, char** argv)
          }
       });
    }
-   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+   cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
    ucache::uCacheManager->readSize = 0;
    ucache::uCacheManager->writeSize = 0;
    thread statThread(statFn);
@@ -1646,7 +1647,7 @@ int benchmark_main(int argc, char** argv)
    });
 
    statThread.join();
-   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
-   bm.ucache_vma->file->close();
+   cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
+   bm->ucache_vma->file->close();
    return 0;
 }
