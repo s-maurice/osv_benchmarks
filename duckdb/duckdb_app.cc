@@ -106,7 +106,7 @@ static void sampler_window(bool on) {
 
 // Runs qnum once; on OSv silently tracks peak memory via a background sampler
 // and prints a single result line.  Returns elapsed ms, or -1.0 on error.
-static double run_query(duckdb::Connection &con, int qnum) {
+static double run_query(duckdb::Connection &con, int qnum, int iteration) {
     const char *sql = tpch::kQueries[qnum];
     printf("\n=== TPC-H Q%02d ===\n", qnum);
 
@@ -175,6 +175,12 @@ static double run_query(duckdb::Connection &con, int qnum) {
 #ifdef __OSV__
     ucache::print_llfree_stats();
     ucache::print_stats();
+    // Machine-readable stats in raw bytes, for the harness parsers.
+    printf("@@ROW,%d,%02d,%.3f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+           iteration, qnum, elapsed / 1000.0,
+           (uint64_t)ucache::uCacheManager->readSize,
+           (uint64_t)ucache::uCacheManager->prefetchedSize,
+           (uint64_t)peak_used);
 #endif
     return elapsed;
 }
@@ -385,6 +391,7 @@ int main(int argc, char** argv)
                phys_free  / (1024.0*1024*1024),
                phys_total / (1024.0*1024*1024));
     }
+    printf("@@HDR,iteration,query,time_s,read_bytes,prefetch_used,peak_used\n");
 #endif
 
     if (run_all) {
@@ -396,7 +403,7 @@ int main(int argc, char** argv)
             if (sample_this) sampler_window(true);
 #endif
             for (int q = 1; q <= 22; q++) {
-                double t = run_query(con, q);
+                double t = run_query(con, q, rep + 1);
                 if (t >= 0.0) t_sum += t;
             }
 #ifdef __OSV__
@@ -412,7 +419,7 @@ int main(int argc, char** argv)
             const bool sample_this = (r + 1 == g_sample_rep);
             if (sample_this) sampler_window(true);
 #endif
-            double t = run_query(con, query_num);
+            double t = run_query(con, query_num, r + 1);
 #ifdef __OSV__
             if (sample_this) sampler_window(false);
 #endif

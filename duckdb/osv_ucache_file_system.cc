@@ -76,52 +76,64 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
     const size_t n = dir->pages.size();
     if (n == 0) return;
 
-    size_t i = dir->evict_cursor.load(std::memory_order_relaxed) % n;
-    for (size_t scanned = 0; scanned < n; scanned++, i = (i + 1 == n) ? 0 : i + 1) {
-        if ((u64)el.size() >= nbToEvict) break;
-        PageEntry& pe = dir->pages[i];
-
-        u64 v = pe.lock.load();
-        u64 s = PageState::getState(v);
-
-        if (s >= 1 && s <= PageState::MaxShared) continue;         // pinned by a reader
-        if (s == PageState::Locked || s == PageState::Evicted) continue;
-
-        if (s == PageState::Unlocked) {
-            pe.lock.tryMark(v);                                     // second chance
-            continue;
-        }
-
-        assert(s == PageState::Marked);
-
-        // Straddling frames belong to two pages. For now, we only evict "inner"
-        // (non-straddling) frames.
-        u64 page_end = pe.offset + (u64)pe.page_size();
-        u64 first = pe.offset / vma->pageSize;
-        u64 last = (page_end - 1) / vma->pageSize;
-        u64 inner_first = (pe.offset % vma->pageSize == 0) ? first : first + 1;
-        u64 inner_end = (page_end % vma->pageSize == 0) ? last + 1 : last;   // exclusive
-        if (inner_first >= inner_end) continue;
-
-        if (!pe.lock.tryLockX(v)) continue;                        // lost race - skip
-
-        bool any = false;
-        for (u64 i = inner_first; i < inner_end && i < vma->buffers.size(); i++) {
+    // Returns whether it handed out any second chance.
+    auto sweep = [&]() -> bool {
+        bool marked = false;
+        size_t i = dir->evict_cursor.load(std::memory_order_relaxed) % n;
+        for (size_t scanned = 0; scanned < n; scanned++, i = (i + 1 == n) ? 0 : i + 1) {
             if ((u64)el.size() >= nbToEvict) break;
-            ucache::Buffer* buf = vma->buffers[i];
-            auto* bs = new ucache::BufferSnapshot(vma->nbPages);
-            buf->updateSnapshot(bs);
-            if (vma->addEvictionCandidate(buf, bs, el))
-                any = true;
-            else
-                delete bs;
-        }
+            PageEntry& pe = dir->pages[i];
 
-        if (!any)
-            pe.lock.unlockXSameVersion(v);
-        // Otherwise post_EvictedBatch releases the lock after the buffers are evicted.
-    }
-    dir->evict_cursor.store((u32)i, std::memory_order_relaxed);
+            u64 v = pe.lock.load();
+            u64 s = PageState::getState(v);
+
+            if (s >= 1 && s <= PageState::MaxShared) continue;   // pinned by a reader
+            if (s == PageState::Locked || s == PageState::Evicted) continue;
+
+            if (s == PageState::Unlocked) {
+                pe.lock.tryMark(v);                                     // second chance
+                marked = true;
+                continue;
+            }
+
+            assert(s == PageState::Marked);
+
+            // Straddling frames belong to two pages. For now, we only evict "inner"
+            // (non-straddling) frames.
+            u64 page_end = pe.offset + (u64)pe.page_size();
+            u64 first = pe.offset / vma->pageSize;
+            u64 last = (page_end - 1) / vma->pageSize;
+            u64 inner_first = (pe.offset % vma->pageSize == 0) ? first : first + 1;
+            u64 inner_end = (page_end % vma->pageSize == 0) ? last + 1 : last;   // exclusive
+            if (inner_first >= inner_end) continue;
+
+            if (!pe.lock.tryLockX(v)) continue;                       // lost race - skip
+
+            bool any = false;
+            for (u64 i = inner_first; i < inner_end && i < vma->buffers.size(); i++) {
+                if ((u64)el.size() >= nbToEvict) break;
+                ucache::Buffer* buf = vma->buffers[i];
+                auto* bs = new ucache::BufferSnapshot(vma->nbPages);
+                buf->updateSnapshot(bs);
+                if (vma->addEvictionCandidate(buf, bs, el))
+                    any = true;
+                else
+                    delete bs;
+            }
+
+            if (!any) {
+                pe.lock.unlockXSameVersion(v);
+            }
+            // Otherwise post_EvictedBatch releases the lock after the buffers are evicted.
+        }
+        dir->evict_cursor.store((u32)i, std::memory_order_relaxed);
+        return marked;
+    };
+
+    // If the sweep marked but didn't evict anything, try again.
+    const size_t start_size = el.size();
+    if (sweep() && el.size() == start_size)
+        sweep();
 }
 
 static bool duckdb_canBeEvicted(ucache::Buffer* /*buf*/) {
@@ -247,6 +259,9 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
     ucache::VMA *vma = ucache::uCacheManager->mmap(path.c_str(), 0, mmu::page_size);
     vma->options.user_data = &dir_ref;
     ucache::uCacheManager->setEvictionPolicy(vma, duckdb_evict_policy);
+    // We sweep dir->pages ourselves, so the resident set is never read.
+    static ucache::NullResidentSet null_rs;
+    vma->residentSet = &null_rs;
     vma->callback_implems.canBeEvicted_implem = duckdb_canBeEvicted;
     vma->callback_implems.post_EvictedBatch_callback_implem = duckdb_postEvictedBatch;
 
@@ -283,11 +298,6 @@ ucache::VMA *OsvUCacheFileSystem::GetOrCreateVMA(
 
     ucache::VMA *vma = ucache::uCacheManager->mmap(
         path.c_str(), file_size, mmu::page_size, nullptr);
-    if (duckdb_rs_ == nullptr)
-        duckdb_rs_ = new ucache::HashTableResidentSet(
-            ucache::uCacheManager->totalPhysSize / mmu::page_size);
-    if (vma->residentSet == ucache::uCacheManager->globalResidentSet)
-        vma->residentSet = duckdb_rs_;
     vma->options.skipTLBShootdown = true;
     return vma;
 }

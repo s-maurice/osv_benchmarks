@@ -208,7 +208,6 @@ private:
 
     std::mutex vma_mu_;
     std::unordered_map<duckdb::string, PageDirectory> page_dirs_;
-    ucache::HashTableResidentSet* duckdb_rs_ = nullptr;
 };
 
 
