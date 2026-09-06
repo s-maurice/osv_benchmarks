@@ -47,6 +47,9 @@ size_t GetThreadSlot();
 void validateFlushTlb(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
 void lockSWithFlush(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
 
+// Maximum size for an optimistic page header read into a stack allocated buffer.
+static constexpr duckdb::idx_t MaxStackHeaderSize = 128;
+
 // Per-file page index. Built once during metadata load.
 struct PageEntry {
     duckdb::idx_t  offset;       // byte offset of page header in file
