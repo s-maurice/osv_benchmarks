@@ -17,6 +17,9 @@
  *   -- OSv only --
  *   UCACHE_MEM=<size>           bytes for uCache (default: 50% of RAM)
  *                               accepts a K/M/G suffix (e.g. 4G, 2048M)
+ *   TPCH_SAMPLE_HZ=<hz>         sample one repetition with OSv's profiler, for
+ *                               scripts/trace.py (default: off)
+ *   TPCH_SAMPLE_REP=<r>         which 1-based repetition to sample (default: last)
  *
  *   -- Both platforms --
  *   DUCKDB_MEM=<size>           DuckDB computation buffer pool
@@ -38,6 +41,8 @@
 
 #ifdef __OSV__
 # include <osv/application.hh>
+# include <osv/sampler.hh>
+# include <chrono>
 # include "osv_ucache_file_system.hpp"
 #else
 # include <sys/sysinfo.h>
@@ -82,6 +87,21 @@ static double now_ms() {
 // Benchmark-wide peak memory stats, updated after each query.
 static u64    g_bm_peak_used       = 0;
 static size_t g_bm_min_huge_blocks = ~(size_t)0;
+
+// Sample one query, we need to fit inside the ring buffer.
+static int g_sample_hz  = 0;
+static int g_sample_rep = 0;   // 1-based repetition to sample
+
+static void sampler_window(bool on) {
+    if (!g_sample_hz) return;
+    if (on) {
+        prof::start_sampler(prof::config{std::chrono::nanoseconds(1000000000 / g_sample_hz)});
+        printf("  [sampler] window open at %d Hz\n", g_sample_hz);
+    } else {
+        prof::stop_sampler();
+        printf("  [sampler] window closed\n");
+    }
+}
 #endif
 
 // Runs qnum once; on OSv silently tracks peak memory via a background sampler
@@ -189,6 +209,14 @@ int main(int argc, char** argv)
     int  repeat    = repeat_env ? atoi(repeat_env) : 1;
 
     if (repeat < 1) repeat = 1;
+
+#ifdef __OSV__
+    const char *sample_hz_env  = getenv("TPCH_SAMPLE_HZ");
+    const char *sample_rep_env = getenv("TPCH_SAMPLE_REP");
+    g_sample_hz = sample_hz_env ? atoi(sample_hz_env) : 0;
+    // Default to last repetition.
+    g_sample_rep = sample_rep_env ? atoi(sample_rep_env) : repeat;
+#endif
 
     // Parse a size string with optional K/M/G suffix into bytes.
     auto parse_mem = [](const char *s) -> u64 {
@@ -363,17 +391,31 @@ int main(int argc, char** argv)
         for (int rep = 0; rep < repeat; rep++) {
             double t_sum = 0.0;
             if (repeat > 1) printf("\n=== SEQUENCE RUN %d/%d ===\n", rep + 1, repeat);
+#ifdef __OSV__
+            const bool sample_this = (rep + 1 == g_sample_rep);
+            if (sample_this) sampler_window(true);
+#endif
             for (int q = 1; q <= 22; q++) {
                 double t = run_query(con, q);
                 if (t >= 0.0) t_sum += t;
             }
+#ifdef __OSV__
+            if (sample_this) sampler_window(false);
+#endif
             printf("\n=== TOTAL time=%.1f ms ===\n", t_sum);
         }
     } else {
         double t_sum = 0.0;
         for (int r = 0; r < repeat; r++) {
             if (repeat > 1) printf("\n=== RUN %d/%d ===\n", r + 1, repeat);
+#ifdef __OSV__
+            const bool sample_this = (r + 1 == g_sample_rep);
+            if (sample_this) sampler_window(true);
+#endif
             double t = run_query(con, query_num);
+#ifdef __OSV__
+            if (sample_this) sampler_window(false);
+#endif
             if (t < 0.0) break;
             t_sum += t;
         }

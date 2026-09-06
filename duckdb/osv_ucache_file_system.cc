@@ -73,9 +73,13 @@ void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len) {
 static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el) {
     auto* dir = static_cast<PageDirectory*>(vma->options.user_data);
     if (!dir) return;
+    const size_t n = dir->pages.size();
+    if (n == 0) return;
 
-    for (auto& pe : dir->pages) {
+    size_t i = dir->evict_cursor.load(std::memory_order_relaxed) % n;
+    for (size_t scanned = 0; scanned < n; scanned++, i = (i + 1 == n) ? 0 : i + 1) {
         if ((u64)el.size() >= nbToEvict) break;
+        PageEntry& pe = dir->pages[i];
 
         u64 v = pe.lock.load();
         u64 s = PageState::getState(v);
@@ -117,6 +121,7 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
             pe.lock.unlockXSameVersion(v);
         // Otherwise post_EvictedBatch releases the lock after the buffers are evicted.
     }
+    dir->evict_cursor.store((u32)i, std::memory_order_relaxed);
 }
 
 static bool duckdb_canBeEvicted(ucache::Buffer* /*buf*/) {

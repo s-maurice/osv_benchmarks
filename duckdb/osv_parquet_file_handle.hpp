@@ -81,6 +81,18 @@ struct PageDirectory {
     // Indices into pages[], sorted by pages[i].offset. Built once in StorePageDirectory.
     // Enables O(log N) lookup from a VMA buffer byte range to overlapping PageEntries.
     std::vector<u32>                 offset_index;
+    // Resume point for the eviction sweep.
+    std::atomic<u32>                 evict_cursor{0};
+
+    PageDirectory() = default;
+    // std::atomic cannot be moved, so we enable moving with 0.
+    PageDirectory(PageDirectory &&o) noexcept
+        : pages(std::move(o.pages)),
+          chunk_start(std::move(o.chunk_start)),
+          num_cols(o.num_cols),
+          thread_versions(std::move(o.thread_versions)),
+          offset_index(std::move(o.offset_index)),
+          evict_cursor(0) {}
 };
 
 // A ResizeableBuffer pointing into VMA memory; RAII pins a PageEntry.
