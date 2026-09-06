@@ -587,10 +587,10 @@ bool vmcache_isDirty(ucache::Buffer* buf) {
 void vmcache_clearDirty(ucache::Buffer* buf) {}
 
 // called after the page has been loaded from disk, before it is made present
-// in the VMA. buf->baseVirt points into the linear physical map.
-void vmcache_post_io_pre_mapped(ucache::Buffer* buf) {
+// in the VMA. page_addr points into the linear physical map.
+void vmcache_post_io_pre_mapped(ucache::Buffer* buf, void* page_addr) {
    // be careful, we cannot use bm::toPID here, because the addr is not in the vma.
-   auto page = reinterpret_cast<Page*>(buf->baseVirt);
+   auto page = reinterpret_cast<Page*>(page_addr);
    VMPageState& ps = page->state;
 
    auto v = ps.load();
