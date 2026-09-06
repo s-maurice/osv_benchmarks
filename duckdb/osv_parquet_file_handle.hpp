@@ -309,19 +309,42 @@ private:
 // Minimal Thrift transport for BuildPageDirectory.  Reads sequentially from a
 // plain FileHandle via FileSystem::Read - no VMA, no caching layer.
 // Used only during page directory construction (one-time, per file).
+// Buffered read, TCompactProtocol reads 1-5 bytes at a time.
 // ─────────────────────────────────────────────────────────────────────────────
 class SimpleFileTransport
     : public duckdb_apache::thrift::transport::TVirtualTransport<SimpleFileTransport> {
 public:
-    SimpleFileTransport(duckdb::FileSystem &fs_p, duckdb::FileHandle &handle_p, duckdb::idx_t size_p)
-        : fs(fs_p), handle(handle_p), location(0), size(size_p) {}
+    static constexpr duckdb::idx_t kBufferSize = 64 * 1024;
 
-    uint32_t read(uint8_t *buf, uint32_t len) {
-        duckdb::idx_t actual = std::min(static_cast<duckdb::idx_t>(len), size - location);
-        if (actual == 0) return 0;
-        fs.Read(handle, buf, static_cast<int64_t>(actual), location);
-        location += actual;
-        return static_cast<uint32_t>(actual);
+    SimpleFileTransport(duckdb::FileSystem &fs_p, duckdb::FileHandle &handle_p, duckdb::idx_t size_p)
+        : fs(fs_p), handle(handle_p), location(0), size(size_p),
+          buf_start(0), buf_len(0)
+    {
+        buf.resize(kBufferSize);
+    }
+
+    uint32_t read(uint8_t *dst, uint32_t len) {
+        duckdb::idx_t remaining = std::min(static_cast<duckdb::idx_t>(len), size - location);
+        if (remaining == 0) return 0;
+        const uint32_t requested = static_cast<uint32_t>(remaining);
+
+        if (remaining > kBufferSize) {
+            fs.Read(handle, dst, static_cast<int64_t>(remaining), location);
+            location += remaining;
+            buf_len = 0;   // buffer no longer describes the current position
+            return requested;
+        }
+
+        while (remaining > 0) {
+            if (location < buf_start || location >= buf_start + buf_len) Refill();
+            duckdb::idx_t avail = buf_start + buf_len - location;
+            duckdb::idx_t n = std::min(avail, remaining);
+            std::memcpy(dst, buf.data() + (location - buf_start), n);
+            dst += n;
+            location += n;
+            remaining -= n;
+        }
+        return requested;
     }
 
     void          SetLocation(duckdb::idx_t loc) { location = loc; }
@@ -329,10 +352,21 @@ public:
     void          Skip(duckdb::idx_t n)          { location += n; }
 
 private:
-    duckdb::FileSystem &fs;
-    duckdb::FileHandle &handle;
-    duckdb::idx_t       location;
-    duckdb::idx_t       size;
+    void Refill() {
+        // std::min not available.
+        const duckdb::idx_t want = size - location;
+        buf_start = location;
+        buf_len = want < kBufferSize ? want : kBufferSize;
+        fs.Read(handle, buf.data(), static_cast<int64_t>(buf_len), buf_start);
+    }
+
+    duckdb::FileSystem  &fs;
+    duckdb::FileHandle  &handle;
+    duckdb::idx_t        location;
+    duckdb::idx_t        size;
+    std::vector<uint8_t> buf;
+    duckdb::idx_t        buf_start;  // file offset of buf[0]
+    duckdb::idx_t        buf_len;    // valid bytes in buf
 };
 
 
