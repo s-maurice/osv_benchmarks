@@ -77,6 +77,10 @@ struct GraveyardEntry { ucache::VMA* vma; u64 frame; };
 static std::mutex g_eviction_graveyard_mu;
 static std::vector<GraveyardEntry> g_eviction_graveyard;
 
+// Vector containing the currently held page locks for eviction.
+struct PendingUnlock { PageDirectory* dir; u32 page_idx; };
+static thread_local std::vector<PendingUnlock> t_pending_unlock;
+
 // Submits every frame covered by the PageEntry range, straddlers between pages[lo..hi]
 // included, and unlocks any page in the run that ends up with no evicted frame.
 static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo, size_t hi,
@@ -106,7 +110,8 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
         }
     }
 
-    // A page with no evicted frame will never reach post_EvictedBatch, so unlock it here.
+    // A page with no evicted frame will never reach post_EvictedBatch (it will not be
+    // submitted for eviction), so unlock it here.
     for (size_t k = lo; k <= hi; k++) {
         PageEntry& pe = dir->pages[k];
         u64 pf_first = pe.offset / vma->pageSize;
@@ -116,7 +121,9 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
             has_frame = std::find(evicted.begin(), evicted.end(), f) != evicted.end();
 
         // todo: check if we should unlock into marked
-        if (!has_frame)
+        if (has_frame)
+            t_pending_unlock.push_back({dir, (u32)k});
+        else
             pe.lock.unlockXSameVersion(pe.lock.load());
     }
 
@@ -183,8 +190,10 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
             if (!evicted) delete bs;
         }
 
-        // post_EvictedBatch releases the pages when the frame does evict.
-        if (!evicted) {
+        if (evicted) {
+            for (u32 pi : held)
+                t_pending_unlock.push_back({dir, pi});
+        } else {
             for (u32 pi : held)
                 dir->pages[pi].lock.unlockXSameVersion(dir->pages[pi].lock.load());
             requeue.push_back(e);
@@ -272,37 +281,64 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
     }
 }
 
+// Eviction cannot fail.
+// We already hold an exclusive lock, the PTE cannot have changed since we snapshotted it.
 static bool duckdb_canBeEvicted(ucache::Buffer* /*buf*/) {
     return true;
 }
 
 static void duckdb_postEvictedBatch(ucache::Buffer* const* buffers, size_t count) {
+    // all the buffers belong to a single vma
     auto* dir = static_cast<PageDirectory*>(buffers[0]->vma->options.user_data);
     if (!dir) return;
 
-    for (size_t i = 0; i < count; i++) {
-        u64 buf_start = (u64)buffers[i]->baseVirt - (u64)buffers[i]->vma->start;
-        u64 buf_end = buf_start + buffers[i]->vma->pageSize;
-
-        auto it = std::lower_bound(dir->offset_index.begin(), dir->offset_index.end(), buf_start,
-            [&](u32 idx, u64 val) {
-                return dir->pages[idx].offset + (u64)dir->pages[idx].page_size() <= val;
-            });
-        // A frame may be shared by several PageEntries; unlock every Locked one overlapping it.
-        for (; it != dir->offset_index.end() && dir->pages[*it].offset < buf_end; ++it) {
-            u32 pi = *it;
-            PageEntry& pe = dir->pages[pi];
-            u64 v = pe.lock.load();
-            if (PageState::getState(v) != PageState::Locked) continue;
-            u64 new_v = PageState::nextVersion(v, PageState::Unlocked);
-            bool ok = pe.lock.stateAndVersion.compare_exchange_strong(v, new_v);
-            assert(ok);
-            // Optimisations: skip the redundant version check and TLB flush that
-            // lockSWithFlush/validateFlushTlb would otherwise fire on this CPU's
-            // next read of the page.
-            dir->thread_versions[GetThreadSlot()][pi] = new_v;
+    // release all the locks
+    size_t keep = 0;
+    for (const PendingUnlock& p : t_pending_unlock) {
+        // belongs to another vma, skip
+        if (p.dir != dir) {
+            t_pending_unlock[keep++] = p;
+            continue;
         }
+        PageEntry& pe = dir->pages[p.page_idx];
+        u64 v = pe.lock.load();
+
+        // we are the lock holder
+        ucache::assert_crash(PageState::getState(v) == PageState::Locked);
+        u64 new_v = pe.lock.unlockXNextVersion(v);
+
+        // Optimisation: skip the redundant version check and TLB flush that
+        // lockSWithFlush/validateFlushTlb would otherwise fire on this CPU's
+        // next read of the page.
+        dir->thread_versions[GetThreadSlot()][p.page_idx] = new_v;
     }
+    t_pending_unlock.resize(keep);
+
+    // Old approach: we previously calculated the mapping back from frame -> page, relying on
+    // buffers[] being provided already sorted by base address by uCache::evict.
+    // This was error prone: for example, we need to make sure we do not unlock a page twice.
+    // The following is true (and must be true): If a frame is evicted, we hold the lock for ALL pages which contain the frame.
+    //
+    // size_t next = 0;
+    // for (size_t i = 0; i < count; i++) {
+    //     u64 buf_start = (u64)buffers[i]->baseVirt - (u64)buffers[i]->vma->start;
+    //     u64 buf_end = buf_start + buffers[i]->vma->pageSize;
+    //
+    //     auto first = std::lower_bound(dir->offset_index.begin(), dir->offset_index.end(), buf_start,
+    //         [&](u32 idx, u64 val) {
+    //             return dir->pages[idx].offset + (u64)dir->pages[idx].page_size() <= val;
+    //         });
+    //     size_t k = std::max(next, (size_t)(first - dir->offset_index.begin()));
+    //
+    //     for (; k < dir->offset_index.size() && dir->pages[dir->offset_index[k]].offset < buf_end; k++) {
+    //         u32 pi = dir->offset_index[k];
+    //         PageEntry& pe = dir->pages[pi];
+    //         u64 v = pe.lock.load();
+    //         ucache::assert_crash(PageState::getState(v) == PageState::Locked);
+    //         dir->thread_versions[GetThreadSlot()][pi] = pe.lock.unlockXNextVersion(v);
+    //     }
+    //     next = k;
+    // }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

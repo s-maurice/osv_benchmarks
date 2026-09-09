@@ -46,8 +46,13 @@ struct PageState {
     // Exclusive lock: CAS current value v to Locked, preserving the version counter.
     // Caller decides which source state is acceptable by checking before calling.
     bool tryLockX(u64 v)        { return stateAndVersion.compare_exchange_strong(v, sameVersion(v, Locked)); }
-    // Unlock after eviction: bump version so readers detect the change.
-    void unlockXNextVersion()   { stateAndVersion.store(nextVersion(stateAndVersion.load(), Unlocked), std::memory_order_release); }
+    // Unlock after eviction: bump version so readers detect the change. v is the current
+    // value, which the caller must be holding X. Returns the stored value.
+    u64 unlockXNextVersion(u64 v) {
+        u64 new_v = nextVersion(v, Unlocked);
+        stateAndVersion.store(new_v, std::memory_order_release);
+        return new_v;
+    }
     // Unlock without bumping version: use when no data changed (e.g. all eviction
     // candidates were already in-flight or Uncached, so no frame was actually freed).
     void unlockXSameVersion(u64 locked_v) { stateAndVersion.store(sameVersion(locked_v, Unlocked), std::memory_order_release); }
