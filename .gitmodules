@@ -13,8 +13,8 @@
 	branch = osv
 [submodule "duckdb/duckdb"]
 	path = duckdb/duckdb
-	url = git@github.com:Meandres/duckdb.git
-	branch = kite
+	url = git@github.com:s-maurice/duckdb.git
+	branch = with-changes
 [submodule "ycsb-leveldb/leveldb"]
 	path = ycsb-leveldb/leveldb
 	url = git@github.com:Meandres/leveldb.git
