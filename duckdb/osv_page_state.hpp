@@ -45,24 +45,23 @@ struct PageState {
 
     // Exclusive lock: CAS current value v to Locked, preserving the version counter.
     // Caller decides which source state is acceptable by checking before calling.
-    bool tryLockX(u64 v)        { return stateAndVersion.compare_exchange_strong(v, sameVersion(v, Locked)); }
-    // Unlock after eviction: bump version so readers detect the change. v is the current
-    // value, which the caller must be holding X. Returns the stored value.
-    u64 unlockXNextVersion(u64 v) {
-        u64 new_v = nextVersion(v, Unlocked);
+    bool tryLockX(u64 v) { return stateAndVersion.compare_exchange_strong(v, sameVersion(v, Locked)); }
+    // Bumps the version so that accessors know that their TLB entry is invalid.
+    // Use this after we have modified any PTEs for frames on this page. Returns the new value.
+    // Caller must already hold an exclusive lock.
+    u64 unlockXEvicted(u64 v) {
+        u64 new_v = nextVersion(v, Evicted);
         stateAndVersion.store(new_v, std::memory_order_release);
         return new_v;
     }
-    // Unlock without bumping version: use when no data changed (e.g. all eviction
-    // candidates were already in-flight or Uncached, so no frame was actually freed).
+    // Use this when we unlock a page without unmapping it in the page table
+    // (we did not invalidate any TLBs). Caller must already hold an exclusive lock.
     void unlockXSameVersion(u64 locked_v) { stateAndVersion.store(sameVersion(locked_v, Unlocked), std::memory_order_release); }
-    void unlockXEvicted()       { stateAndVersion.store(nextVersion(stateAndVersion.load(), Evicted),  std::memory_order_release); }
-    void downgradeLock()        { stateAndVersion.store(nextVersion(stateAndVersion.load(), 1),        std::memory_order_release); }
 
     bool tryLockS(u64 v) {
         u64 s = getState(v);
         if (s < MaxShared) return stateAndVersion.compare_exchange_strong(v, sameVersion(v, s+1));
-        if (s == Marked) return stateAndVersion.compare_exchange_strong(v, sameVersion(v, 1));
+        if (s == Marked || s == Evicted) return stateAndVersion.compare_exchange_strong(v, sameVersion(v, 1));
         return false;
     }
 
@@ -84,6 +83,10 @@ struct PageState {
     }
 
     // Returns a version counter for optimistic reads (no lock taken).
+    // Spins while Evicted: the optimistic (lock-free) read path relies on this never
+    // returning a snapshot of an unmapped page, since it will memcpy straight out of
+    // VMA memory with no PageState lock held.
+    // TODO: clean up optimistic reads and their interaction with the Evicted state.
     u64 beginRead() {
         for (;;) {
             u64 v = stateAndVersion.load();

@@ -305,7 +305,7 @@ static void duckdb_postEvictedBatch(ucache::Buffer* const* buffers, size_t count
 
         // we are the lock holder
         ucache::assert_crash(PageState::getState(v) == PageState::Locked);
-        u64 new_v = pe.lock.unlockXNextVersion(v);
+        u64 new_v = pe.lock.unlockXEvicted(v);
 
         // Optimisation: skip the redundant version check and TLB flush that
         // lockSWithFlush/validateFlushTlb would otherwise fire on this CPU's
@@ -366,7 +366,7 @@ void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u6
     for (;;) {
         u64 v = ps.load();
         u64 s = PageState::getState(v);
-        if (s == PageState::Locked || s == PageState::Evicted) {
+        if (s == PageState::Locked) {
             _mm_pause();
             continue;
         }

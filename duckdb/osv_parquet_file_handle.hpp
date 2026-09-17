@@ -62,7 +62,8 @@ struct PageEntry {
     PageEntry(duckdb::idx_t off, duckdb::idx_t hdr_sz, duckdb::idx_t body_sz)
         : offset(off), header_size(hdr_sz), body_size(body_sz)
     {
-        lock.stateAndVersion.store(0, std::memory_order_relaxed); // Unlocked, version 0
+        lock.stateAndVersion.store(PageState::sameVersion(0, PageState::Evicted),
+                                    std::memory_order_relaxed); // Evicted, version 0
     }
     PageEntry(PageEntry &&o) noexcept
         : offset(o.offset), header_size(o.header_size), body_size(o.body_size)
