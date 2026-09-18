@@ -5,6 +5,7 @@
 #include <duckdb/common/file_open_flags.hpp>
 
 #include <osv/mmu.hh>
+#include <osv/sched.hh>
 
 #include <cstdio>
 #include <cstring>
@@ -349,6 +350,11 @@ size_t GetThreadSlot() {
     return static_cast<size_t>(sched::cpu::current()->id);
 }
 
+// We need to make sure we don't migrate to another core (with an unknown TLB state) after
+// we have validated our TLB.
+void DisableMigration() { sched::migrate_disable(); }
+void EnableMigration()  { sched::migrate_enable(); }
+
 void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size) {
     std::vector<void *> flush_pages;
     auto make_flush_pages = [&]() -> std::vector<void *> & {
@@ -384,7 +390,8 @@ void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u6
 }
 
 void validateFlushTlb(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size) {
-    if (ps.validateRead(local_version)) return;
+    u64 cur = ps.load();
+    if (PageState::getVersion(cur) == PageState::getVersion(local_version)) return;
     static constexpr u64 k = 4096;
     uintptr_t start = reinterpret_cast<uintptr_t>(page_addr) & ~(k - 1);
     uintptr_t end = reinterpret_cast<uintptr_t>(page_addr) + page_size;
@@ -393,7 +400,7 @@ void validateFlushTlb(PageState &ps, u64 &local_version, const char *page_addr, 
     for (uintptr_t p = start; p < end; p += k)
         pages.push_back(reinterpret_cast<void *>(p));
     mmu::invlpg_tlb_local(pages.data(), pages.size());
-    local_version = ps.beginRead();
+    local_version = cur;
 }
 
 PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &path,

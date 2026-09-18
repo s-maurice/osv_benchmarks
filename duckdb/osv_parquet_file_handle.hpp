@@ -40,15 +40,14 @@ class Buffer;
 
 namespace osv_duckdb {
 
-// Forward declarations needed by VmaPinnedBuffer / ScopedPagePin constructors.
+// Forward declarations needed by the VmaPagePin constructor.
 struct PageDirectory;
 struct PageState;
 size_t GetThreadSlot();
 void validateFlushTlb(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
 void lockSWithFlush(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
-
-// Maximum size for an optimistic page header read into a stack allocated buffer.
-static constexpr duckdb::idx_t MaxStackHeaderSize = 128;
+void DisableMigration();
+void EnableMigration();
 
 // Per-file page index. Built once during metadata load.
 struct PageEntry {
@@ -78,6 +77,7 @@ struct PageEntry {
 struct PageDirectory {
     std::vector<PageEntry>           pages;           // flat across all row groups and columns
     std::vector<duckdb::idx_t>       chunk_start;     // [rg * num_cols + col] -> start in pages
+    std::vector<duckdb::idx_t>       chunk_page_count;// [rg * num_cols + col] -> page count for that chunk
     duckdb::idx_t                    num_cols = 0;
     // Per-thread last-seen version for each page. [cpu_slot][page_idx], init to NO_VERSION.
     // Allocated in StorePageDirectory once sched::cpus.size() is known.
@@ -93,88 +93,52 @@ struct PageDirectory {
     PageDirectory(PageDirectory &&o) noexcept
         : pages(std::move(o.pages)),
           chunk_start(std::move(o.chunk_start)),
+          chunk_page_count(std::move(o.chunk_page_count)),
           num_cols(o.num_cols),
           thread_versions(std::move(o.thread_versions)),
           offset_index(std::move(o.offset_index)),
           evict_cursor(0) {}
 };
 
-// A ResizeableBuffer pointing into VMA memory; RAII pins a PageEntry.
-struct VmaPinnedBuffer : public duckdb::ResizeableBuffer {
-    PageDirectory *dir;
-    duckdb::idx_t  page_idx;
+// RAII guard for a PageState S-lock.
+// Inherits from ResizeableBuffer, meaning we support zero-copy passing into DuckDB for
+// uncompressed + unencrypted pages.
+//
+// Assumes worker threads are pinned to a CPU (DuckDB's pin_threads setting).
+// See DisableMigration()/EnableMigration() below if that assumption ever needs enforcing here.
+struct VmaPagePin : public duckdb::ResizeableBuffer {
+    PageDirectory *dir;       // owning directory
+    duckdb::idx_t  page_idx;  // index of the locked page within dir->pages
+    bool           owns_lock; // false when adopting an already-held lock (see already_locked)
 
-    VmaPinnedBuffer(const char *vma_ptr, uint64_t size,
-                    PageDirectory *dir_p, duckdb::idx_t idx,
-                    const char *vma_base_p)
-        : dir(dir_p), page_idx(idx)
+    // already_locked: lock already held elsewhere; we only re-validate the TLB, never take/release it.
+    // vma_ptr: pointer to the pinned byte range (e.g. vma_base_p + offset), not the VMA base.
+    VmaPagePin(const char *vma_ptr, uint64_t size,
+               PageDirectory *dir_p, duckdb::idx_t page_idx_p,
+               const char *vma_base_p, bool already_locked = false)
+        : dir(dir_p), page_idx(page_idx_p), owns_lock(!already_locked)
     {
         ptr = reinterpret_cast<duckdb::data_ptr_t>(const_cast<char *>(vma_ptr));
         len = size + 1;  // match AllocateBlock(uncompressed_size + 1); required by ByteStreamSplitDecoder
         u64 &local_ver = dir->thread_versions[GetThreadSlot()][page_idx];
-        lockSWithFlush(dir->pages[page_idx].lock, local_ver,
-                       vma_base_p + dir->pages[page_idx].offset,
-                       static_cast<u64>(dir->pages[page_idx].page_size()));
+        auto &pe = dir->pages[page_idx];
+        if (already_locked) {
+            // We may have moved threads since the lock was acquired - re-validate the TLB.
+            validateFlushTlb(pe.lock, local_ver, vma_base_p + pe.offset,
+                              static_cast<u64>(pe.page_size()));
+        } else {
+            lockSWithFlush(pe.lock, local_ver, vma_base_p + pe.offset,
+                           static_cast<u64>(pe.page_size()));
+        }
     }
 
-    ~VmaPinnedBuffer() {
-        dir->pages[page_idx].lock.unlockS();
+    ~VmaPagePin() {
+        if (owns_lock) dir->pages[page_idx].lock.unlockS();
     }
 
     void resize(duckdb::Allocator &, uint64_t) {
         D_ASSERT(false); // must not resize a VMA-backed buffer
     }
-};
-
-// RAII pin so eviction cannot unmap the pages during a read.
-struct ScopedPagePin {
-    PageDirectory *dir;
-    duckdb::idx_t  page_idx;
-    bool           active = true;
-
-    ScopedPagePin(PageDirectory *dir_p, duckdb::idx_t idx, const char *vma_base_p)
-        : dir(dir_p), page_idx(idx)
-    {
-        u64 &local_ver = dir->thread_versions[GetThreadSlot()][page_idx];
-        lockSWithFlush(dir->pages[page_idx].lock, local_ver,
-                       vma_base_p + dir->pages[page_idx].offset,
-                       static_cast<u64>(dir->pages[page_idx].page_size()));
-    }
-    ~ScopedPagePin() {
-        if (active) dir->pages[page_idx].lock.unlockS();
-    }
-    void release() {
-        if (active) {
-            dir->pages[page_idx].lock.unlockS();
-            active = false;
-        }
-    }
-    ScopedPagePin(const ScopedPagePin &) = delete;
-    ScopedPagePin &operator=(const ScopedPagePin &) = delete;
-};
-
-// Thrift transport over a local byte buffer, so header parsing holds no VMA pin.
-class MemoryBufferTransport
-    : public duckdb_apache::thrift::transport::TVirtualTransport<MemoryBufferTransport> {
-public:
-    MemoryBufferTransport(const uint8_t *data, uint32_t len)
-        : data_(data), len_(len), pos_(0) {}
-
-    uint32_t read(uint8_t *buf, uint32_t len) {
-        uint32_t available = len_ - pos_;
-        uint32_t to_read = std::min(len, available);
-        if (to_read == 0) return 0;
-        std::memcpy(buf, data_ + pos_, to_read);
-        pos_ += to_read;
-        return to_read;
-    }
-
-    uint32_t GetPosition() const { return pos_; }
-
-private:
-    const uint8_t *data_;
-    uint32_t       len_;
-    uint32_t       pos_;
 };
 
 // Issue async IO for the [pos, pos+len) byte range into the VMA's uCache buffers.
@@ -195,6 +159,10 @@ void validateFlushTlb(PageState &ps, u64 &local_version, const char *page_addr, 
 // and re-flushes if needed. On return: lock is held and local_version equals
 // the version at which the lock was acquired.
 void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size);
+
+// Make sure we don't migrate to another core after validating our TLB entries.
+void DisableMigration();
+void EnableMigration();
 
 
 // CachingFileHandle backed by a uCache VMA: reads return a pointer into VMA memory,
@@ -298,8 +266,11 @@ public:
 
     bool HasPrefetch() const override { return !prefetch_registered; }
 
-    void RegisterPrefetch(duckdb::idx_t pos, uint64_t len, bool /*can_merge*/ = true) override {
-        handle.RegisterPrefetch(pos, static_cast<duckdb::idx_t>(len));
+    // can_merge=false means that this column has a filter, and we should avoid prefetching it.
+    void RegisterPrefetch(duckdb::idx_t pos, uint64_t len, bool can_merge = true) override {
+        if (can_merge) {
+            handle.RegisterPrefetch(pos, static_cast<duckdb::idx_t>(len));
+        }
     }
     void FinalizeRegistration() override {}
     void Prefetch(duckdb::idx_t pos, uint64_t len) override {

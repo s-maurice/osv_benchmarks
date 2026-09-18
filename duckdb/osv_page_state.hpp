@@ -26,7 +26,7 @@ struct PageState {
     static const u64 Marked = 254;
     static const u64 Evicted = 255;
 
-    // Sentinel that always fails validateRead() - state bits = Evicted (255).
+    // Sentinel version that never matches a real version, forcing a TLB flush on first use.
     static constexpr u64 NO_VERSION = ~0ULL;
 
     PageState() {}
@@ -80,29 +80,6 @@ struct PageState {
             assert(s > 0 && s <= MaxShared);
             if (stateAndVersion.compare_exchange_strong(v, sameVersion(v, s-1))) return;
         }
-    }
-
-    // Returns a version counter for optimistic reads (no lock taken).
-    // Spins while Evicted: the optimistic (lock-free) read path relies on this never
-    // returning a snapshot of an unmapped page, since it will memcpy straight out of
-    // VMA memory with no PageState lock held.
-    // TODO: clean up optimistic reads and their interaction with the Evicted state.
-    u64 beginRead() {
-        for (;;) {
-            u64 v = stateAndVersion.load();
-            u64 s = getState(v);
-            if (s != Locked && s != Evicted) return v;
-            _mm_pause();
-        }
-    }
-
-    // Returns true if the version counter hasn't changed since beginRead().
-    bool validateRead(u64 v) {
-        u64 cur = stateAndVersion.load();
-        if (cur == v) return true;
-        if ((cur << 8) != (v << 8)) return false;
-        u64 s = getState(cur);
-        return s <= MaxShared || s == Marked;
     }
 
     bool tryMark(u64 v) { return stateAndVersion.compare_exchange_strong(v, sameVersion(v, Marked)); }
