@@ -423,6 +423,8 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
 
     ucache::VMA *vma = ucache::uCacheManager->mmap(path.c_str(), 0, mmu::page_size);
     vma->options.user_data = &dir_ref;
+    // We can disable TLB shootdowns because we handle signaling PTE updates with PageEntries.
+    vma->options.skipTLBShootdown = true;
     ucache::uCacheManager->setEvictionPolicy(vma, duckdb_evict_policy);
     // We sweep dir->pages ourselves, so the resident set is never read.
     static ucache::NullResidentSet null_rs;
@@ -463,7 +465,7 @@ ucache::VMA *OsvUCacheFileSystem::GetOrCreateVMA(
 
     ucache::VMA *vma = ucache::uCacheManager->mmap(
         path.c_str(), file_size, mmu::page_size, nullptr);
-    vma->options.skipTLBShootdown = true;
+    // We don't set skipTLBShootdown here, instead we set it later when we set up the PageDirectory.
     return vma;
 }
 
