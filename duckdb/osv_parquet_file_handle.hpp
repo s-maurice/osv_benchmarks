@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include <duckdb/common/atomic.hpp>
@@ -46,6 +47,7 @@ struct PageState;
 size_t GetThreadSlot();
 void validateFlushTlb(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
 void lockSWithFlush(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
+void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len);
 void DisableMigration();
 void EnableMigration();
 
@@ -88,6 +90,10 @@ struct PageDirectory {
     // Resume point for the eviction sweep.
     std::atomic<u32>                 evict_cursor{0};
 
+    // [row_group_idx] -> bloom filter PageEntry index in pages[], or NO_BLOOM_PAGE.
+    static constexpr duckdb::idx_t NO_BLOOM_PAGE = ~static_cast<duckdb::idx_t>(0);
+    std::vector<duckdb::idx_t> rg_bloom_page;
+
     PageDirectory() = default;
     // std::atomic cannot be moved, so we enable moving with 0.
     PageDirectory(PageDirectory &&o) noexcept
@@ -97,7 +103,8 @@ struct PageDirectory {
           num_cols(o.num_cols),
           thread_versions(std::move(o.thread_versions)),
           offset_index(std::move(o.offset_index)),
-          evict_cursor(0) {}
+          evict_cursor(0),
+          rg_bloom_page(std::move(o.rg_bloom_page)) {}
 };
 
 // RAII guard for a PageState S-lock.
@@ -136,9 +143,45 @@ struct VmaPagePin : public duckdb::ResizeableBuffer {
         if (owns_lock) dir->pages[page_idx].lock.unlockS();
     }
 
+    void Prefetch(ucache::VMA *vma) {
+        auto &pe = dir->pages[page_idx];
+        enqueue_prefetch(vma, pe.offset, pe.page_size());
+    }
+
     void resize(duckdb::Allocator &, uint64_t) {
         D_ASSERT(false); // must not resize a VMA-backed buffer
     }
+};
+
+// Non-allocating optional<VmaPagePin>, since VmaPagePin has no default constructor.
+class OptionalVmaPagePin {
+    alignas(VmaPagePin) unsigned char storage_[sizeof(VmaPagePin)];
+    bool engaged_ = false;
+
+    VmaPagePin *ptr() { return reinterpret_cast<VmaPagePin *>(storage_); }
+
+public:
+    OptionalVmaPagePin() = default;
+    OptionalVmaPagePin(const OptionalVmaPagePin &) = delete;
+    OptionalVmaPagePin &operator=(const OptionalVmaPagePin &) = delete;
+    ~OptionalVmaPagePin() { Reset(); }
+
+    template <typename... Args>
+    void Emplace(Args &&...args) {
+        Reset();
+        new (storage_) VmaPagePin(std::forward<Args>(args)...);
+        engaged_ = true;
+    }
+
+    void Reset() {
+        if (engaged_) {
+            ptr()->~VmaPagePin();
+            engaged_ = false;
+        }
+    }
+
+    VmaPagePin *operator->() { return ptr(); }
+    explicit operator bool() const { return engaged_; }
 };
 
 // Issue async IO for the [pos, pos+len) byte range into the VMA's uCache buffers.
