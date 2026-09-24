@@ -103,7 +103,7 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
         auto* bs = new ucache::BufferSnapshot(vma->nbPages);
         buf->updateSnapshot(bs);
         // todo: add non-failable addEvictionCandidate
-        if (vma->addEvictionCandidate(buf, bs, el)) {
+        if (vma->addEvictionCandidateAllowUnaccessed(buf, bs, el)) {
             evicted.push_back(fi);
         } else {
             delete bs;
@@ -187,7 +187,7 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
             ucache::Buffer* buf = vma->buffers[e.frame];
             auto* bs = new ucache::BufferSnapshot(vma->nbPages);
             buf->updateSnapshot(bs);
-            evicted = vma->addEvictionCandidate(buf, bs, el);
+            evicted = vma->addEvictionCandidateAllowUnaccessed(buf, bs, el);
             if (!evicted) delete bs;
         }
 
