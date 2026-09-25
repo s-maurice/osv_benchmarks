@@ -85,7 +85,7 @@ static thread_local std::vector<PendingUnlock> t_pending_unlock;
 // Submits every frame covered by the PageEntry range, straddlers between pages[lo..hi]
 // included, and unlocks any page in the run that ends up with no evicted frame.
 static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo, size_t hi,
-                                 ucache::EvictList el, u64 nbToEvict) {
+                                 ucache::EvictList el) {
     u64 start = dir->pages[lo].offset;
     u64 end = dir->pages[hi].offset + (u64)dir->pages[hi].page_size();
     // Frames fully inside [start, end). A frame straddling the run's edge is shared with a
@@ -99,7 +99,7 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
     std::vector<u64> rejected;
     const u64 fi0 = fi;
 
-    for (; fi < inner_end && (u64)el.size() < nbToEvict && fi < vma->buffers.size(); fi++) {
+    for (; fi < inner_end && fi < vma->buffers.size(); fi++) {
         ucache::Buffer* buf = vma->buffers[fi];
         auto* bs = new ucache::BufferSnapshot(vma->nbPages);
         buf->updateSnapshot(bs);
@@ -257,7 +257,7 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
         size_t run_hi = 0;
 
         auto end_run = [&]() {
-            if (in_run) evict_frames_in_run(dir, vma, run_lo, run_hi, el, nbToEvict);
+            if (in_run) evict_frames_in_run(dir, vma, run_lo, run_hi, el);
             in_run = false;
         };
 
@@ -302,6 +302,10 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
                 in_run = true;
             }
             run_hi = i;
+
+            // check if we have evicted enough frames
+            u64 run_bytes = pe.offset + (u64)pe.page_size() - dir->pages[run_lo].offset;
+            if ((u64)el.size() + run_bytes / vma->pageSize >= nbToEvict) end_run();
         }
 
         end_run();
