@@ -72,8 +72,8 @@ void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len) {
 // Eviction callbacks for DuckDB VMA
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Frames addEvictionCandidate rejected; retried by drain_eviction_graveyard() at the top of
-// the next eviction.
+// Frames whose eviction was rejected (prefetch I/O still pending), retried at each eviction.
+// Their pages stay Evicted, so only the graveyard evicts them; dropped if a reader relocks a page.
 struct GraveyardEntry { ucache::VMA* vma; u64 frame; };
 static std::mutex g_eviction_graveyard_mu;
 static std::vector<GraveyardEntry> g_eviction_graveyard;
@@ -143,8 +143,8 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
         // todo: check if we should unlock into marked
         if (has_frame) {
             t_pending_unlock.push_back({dir, (u32)k});
-        } else if (all_uncached) {
-            // if all were Uncached, we can go to the Evicted state.
+        } else if (all_uncached || has_rejected) {
+            // if all were Uncached, or the rest are in the graveyard, we can go to the Evicted state.
             pe.lock.unlockXEvictedSameVersion(pe.lock.load());
         } else {
             pe.lock.unlockXSameVersion(pe.lock.load());
@@ -152,10 +152,7 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
     }
 
     if (!rejected.empty()) {
-        // Failing to evict a frame should be _very_ rare. One possible reason is as follows:
-        // We had I/O registered for the frame, but we never read from the frame (and thus never
-        // blocked on it). Then, we release the Page's lock, and the PageEntry is selected for
-        // eviction. We cannot release that frame, as the frame is still being used for I/O.
+        // Prefetch I/O still pending: the device may still write into the frame, so retry later.
         std::printf("[evict] %zu frame(s) not evicted\n", rejected.size());
         std::scoped_lock lk(g_eviction_graveyard_mu);
         for (u64 f : rejected) g_eviction_graveyard.push_back({vma, f});
@@ -186,8 +183,11 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
 
         // Lock every PageEntry overlapping the frame, all-or-nothing, in ascending offset
         // order so concurrent drains cannot deadlock.
+        // Graveyard pages are Evicted. We need to take X lock on all pages, and signal TLB
+        // invalidation with version bump.
         held.clear();
         bool all_held = true;
+        bool reread = false;
         auto it = std::lower_bound(dir->offset_index.begin(), dir->offset_index.end(), f_start,
             [&](u32 idx, u64 val) {
                 return dir->pages[idx].offset + (u64)dir->pages[idx].page_size() <= val;
@@ -196,9 +196,15 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
             PageEntry& pe = dir->pages[*it];
             u64 v = pe.lock.load();
             u64 s = PageState::getState(v);
+            // a reader relocked the page: drop the entry, the frame now belongs to that reader.
+            if (s == PageState::Unlocked || s == PageState::Marked) {
+                reread = true;
+                all_held = false;
+                break;
+            }
             // A shared count means a reader is inside the page, Locked means another evictor
             // owns it. Either way the frame is not ours this round.
-            if ((s != PageState::Unlocked && s != PageState::Marked) || !pe.lock.tryLockX(v)) {
+            if (s != PageState::Evicted || !pe.lock.tryLockX(v)) {
                 all_held = false;
                 break;
             }
@@ -225,12 +231,12 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
         if (evicted) {
             for (u32 pi : held)
                 t_pending_unlock.push_back({dir, pi});
-        } else if (nothing_left) {
+        } else if (nothing_left || reread) {
             for (u32 pi : held)
-                dir->pages[pi].lock.unlockXSameVersion(dir->pages[pi].lock.load());
+                dir->pages[pi].lock.unlockXEvictedSameVersion(dir->pages[pi].lock.load());
         } else {
             for (u32 pi : held)
-                dir->pages[pi].lock.unlockXSameVersion(dir->pages[pi].lock.load());
+                dir->pages[pi].lock.unlockXEvictedSameVersion(dir->pages[pi].lock.load());
             requeue.push_back(e);
         }
     }
