@@ -16,10 +16,10 @@
 namespace osv_duckdb {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// enqueue_prefetch - called by OsvCachingFileHandle::RegisterPrefetch()
+// enqueue_prefetch - called after readers lock pages (AcquireChunkLocks, VmaPagePin::Prefetch),
+// and for footer/metadata reads (OsvCachingFileHandle::RegisterPrefetch).
 //
-// DuckDB already knows which byte ranges it will need next; this function
-// immediately issues async NVMe IO for all pages in [pos, pos+len) that are
+// Immediately issues async NVMe IO for all pages in [pos, pos+len) that are
 // not yet in the cache.  When the page fault arrives later, checkPipeline()
 // in uCache::handleFault() finds the buffer in Reading/ReadyToInsert state
 // and simply polls for completion rather than starting a new synchronous read.

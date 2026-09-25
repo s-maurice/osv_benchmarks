@@ -15,7 +15,7 @@
 //   OsvUCacheFileSystem::OpenParquetHandle(path, …)
 //     → returns OsvCachingFileHandle (see osv_parquet_file_handle.hpp)
 //     → the Parquet reader reads DIRECTLY from VMA memory (zero-copy)
-//     → DuckDB calls RegisterPrefetch(pos, len) → enqueue_prefetch()
+//     → readers S-lock PageEntries (AcquireChunkLocks / VmaPagePin), then call enqueue_prefetch()
 //         → uCacheManager->prefetch(vma, pl) issues async NVMe IO immediately
 //     → page fault arrives later; checkPipeline() polls the in-flight IO to
 //       completion rather than starting a new synchronous read.
@@ -105,9 +105,7 @@ public:
         duckdb::optional_ptr<duckdb::FileOpener> opener = nullptr) override;
 
     // Open a Parquet-optimised handle that reads directly from VMA memory.
-    // The handle's prefetch policy is wired to parquet_prefetch_pol so that
-    // DuckDB's RegisterPrefetch / PrefetchRegistered calls drive async NVMe I/O
-    // through uCache's prefetch hookpoint.
+    // Page data is prefetched after page locking (AcquireChunkLocks / VmaPagePin).
     duckdb::unique_ptr<OsvCachingFileHandle> OpenParquetHandle(
         const duckdb::string &path,
         duckdb::FileOpenFlags flags,
