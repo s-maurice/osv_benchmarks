@@ -57,6 +57,9 @@ struct PageState {
     // Use this when we unlock a page without unmapping it in the page table
     // (we did not invalidate any TLBs). Caller must already hold an exclusive lock.
     void unlockXSameVersion(u64 locked_v) { stateAndVersion.store(sameVersion(locked_v, Unlocked), std::memory_order_release); }
+    // Unlock into Evicted without bumping the version.
+    // Caller must already hold an exclusive lock.
+    void unlockXEvictedSameVersion(u64 locked_v) { stateAndVersion.store(sameVersion(locked_v, Evicted), std::memory_order_release); }
 
     bool tryLockS(u64 v) {
         u64 s = getState(v);

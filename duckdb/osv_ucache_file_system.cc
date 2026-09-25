@@ -97,11 +97,18 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
 
     std::vector<u64> evicted;
     std::vector<u64> rejected;
+    const u64 fi0 = fi;
 
     for (; fi < inner_end && (u64)el.size() < nbToEvict && fi < vma->buffers.size(); fi++) {
         ucache::Buffer* buf = vma->buffers[fi];
         auto* bs = new ucache::BufferSnapshot(vma->nbPages);
         buf->updateSnapshot(bs);
+
+        // validate: is this even possible?
+        if (bs->state == ucache::BufferState::Uncached) {
+            delete bs;
+            continue;
+        }
         // todo: add non-failable addEvictionCandidate
         if (vma->addEvictionCandidateAllowUnaccessed(buf, bs, el)) {
             evicted.push_back(fi);
@@ -111,6 +118,13 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
         }
     }
 
+    const u64 fi_end = fi; // frames [fi0, fi_end) were attempted
+
+    // frames are stored in ascending order
+    auto contains = [](const std::vector<u64>& v, u64 f) {
+        return std::binary_search(v.begin(), v.end(), f);
+    };
+
     // A page with no evicted frame will never reach post_EvictedBatch (it will not be
     // submitted for eviction), so unlock it here.
     for (size_t k = lo; k <= hi; k++) {
@@ -118,14 +132,23 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
         u64 pf_first = pe.offset / vma->pageSize;
         u64 pf_end = (pe.offset + (u64)pe.page_size() - 1) / vma->pageSize + 1;
         bool has_frame = false;
-        for (u64 f = pf_first; f < pf_end && !has_frame; f++)
-            has_frame = std::find(evicted.begin(), evicted.end(), f) != evicted.end();
+        bool has_rejected = false;
+        for (u64 f = pf_first; f < pf_end; f++) {
+            if (contains(evicted, f)) has_frame = true;
+            if (contains(rejected, f)) has_rejected = true;
+        }
+        // every frame attempted, none evicted or rejected: all were Uncached
+        bool all_uncached = !has_frame && !has_rejected && pf_first >= fi0 && pf_end <= fi_end;
 
         // todo: check if we should unlock into marked
-        if (has_frame)
+        if (has_frame) {
             t_pending_unlock.push_back({dir, (u32)k});
-        else
+        } else if (all_uncached) {
+            // if all were Uncached, we can go to the Evicted state.
+            pe.lock.unlockXEvictedSameVersion(pe.lock.load());
+        } else {
             pe.lock.unlockXSameVersion(pe.lock.load());
+        }
     }
 
     if (!rejected.empty()) {
@@ -183,17 +206,28 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
         }
 
         bool evicted = false;
+        bool nothing_left = false;
         if (all_held) {
             ucache::Buffer* buf = vma->buffers[e.frame];
             auto* bs = new ucache::BufferSnapshot(vma->nbPages);
             buf->updateSnapshot(bs);
-            evicted = vma->addEvictionCandidateAllowUnaccessed(buf, bs, el);
-            if (!evicted) delete bs;
+            if (bs->state == ucache::BufferState::Uncached) {
+                // Already freed (or never loaded): nothing to evict, and retrying would
+                // fail forever (CachedToEvicting refuses Uncached frames).
+                delete bs;
+                nothing_left = true;
+            } else {
+                evicted = vma->addEvictionCandidateAllowUnaccessed(buf, bs, el);
+                if (!evicted) delete bs;
+            }
         }
 
         if (evicted) {
             for (u32 pi : held)
                 t_pending_unlock.push_back({dir, pi});
+        } else if (nothing_left) {
+            for (u32 pi : held)
+                dir->pages[pi].lock.unlockXSameVersion(dir->pages[pi].lock.load());
         } else {
             for (u32 pi : held)
                 dir->pages[pi].lock.unlockXSameVersion(dir->pages[pi].lock.load());
