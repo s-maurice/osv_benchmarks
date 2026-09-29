@@ -316,6 +316,8 @@ int main(int argc, char** argv)
 
     duckdb::DuckDB db(nullptr, &config);
     duckdb::Connection con(db);
+    // Same as tpch/preamble.sql, which the CLI legs run.
+    con.Query("SET parquet_metadata_cache=true");
 
     // if (file_cache_mem > 0) {
     //     duckdb::ExternalFileCache::Get(*con.context).SetMaxBytes(file_cache_mem);
@@ -359,30 +361,34 @@ int main(int argc, char** argv)
                 osv_fs->PreOpen(tpch::kQueryFiles[query_num][i]);
         }
         printf("  [pre-open] time=%.1f ms\n", now_ms() - t_preopen);
+    }
+#endif
 
-        // Pre-read all parquet files so the page directories are built and excluded
-        // from the timings. LIMIT 0 does this without scanning.
+    // Pre-read all parquet files so the metadata is cached (and on OSv the page
+    // directories are built) outside the timings. LIMIT 0 does this without scanning.
+    {
         double t_meta = now_ms();
-        {
-            auto warm_file = [&](const char *path) {
-                duckdb::string sql = "SELECT * FROM '";
-                sql += path;
-                sql += "' LIMIT 0";
-                auto r = con.Query(sql);
-                if (r->HasError())
-                    printf("  [metadata] WARN %s: %s\n", path, r->GetError().c_str());
-            };
-            if (run_all) {
-                for (int q = 1; q <= 22; q++)
-                    for (int i = 0; tpch::kQueryFiles[q][i] != nullptr; i++)
-                        warm_file(tpch::kQueryFiles[q][i]);
-            } else {
-                for (int i = 0; tpch::kQueryFiles[query_num][i] != nullptr; i++)
-                    warm_file(tpch::kQueryFiles[query_num][i]);
-            }
+        auto warm_file = [&](const char *path) {
+            duckdb::string sql = "SELECT * FROM '";
+            sql += path;
+            sql += "' LIMIT 0";
+            auto r = con.Query(sql);
+            if (r->HasError())
+                printf("  [metadata] WARN %s: %s\n", path, r->GetError().c_str());
+        };
+        if (run_all) {
+            for (int q = 1; q <= 22; q++)
+                for (int i = 0; tpch::kQueryFiles[q][i] != nullptr; i++)
+                    warm_file(tpch::kQueryFiles[q][i]);
+        } else {
+            for (int i = 0; tpch::kQueryFiles[query_num][i] != nullptr; i++)
+                warm_file(tpch::kQueryFiles[query_num][i]);
         }
         printf("  [metadata] time=%.1f ms\n", now_ms() - t_meta);
+    }
 
+#ifdef __OSV__
+    {
         u64 phys_free  = ucache::stat_free_phys_mem();
         u64 phys_total = ucache::stat_total_phys_mem();
         u64 phys_used  = phys_total - phys_free;
