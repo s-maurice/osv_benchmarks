@@ -335,6 +335,66 @@ private:
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OsvFooterTransport
+//
+// Reads the Parquet footer into a heap buffer through the inner file handle.
+// Used instead of the VMA, which would leave the footer's frames permanently
+// stuck in the VMA. Prefetch hints extend the buffer, so a footer takes 1-2 reads.
+// ─────────────────────────────────────────────────────────────────────────────
+class OsvFooterTransport
+    : public duckdb_apache::thrift::transport::TVirtualTransport<OsvFooterTransport>,
+      public duckdb::ParquetTransportBase {
+public:
+    explicit OsvFooterTransport(OsvCachingFileHandle &handle_p)
+        : handle(handle_p), location(0), size(handle_p.file_size), buf_start(handle_p.file_size)
+    {}
+
+    uint32_t read(uint8_t *dst, uint32_t len) override {
+        if (location >= size) return 0;
+        duckdb::idx_t actual = std::min(static_cast<duckdb::idx_t>(len), size - location);
+        Load(location);
+        std::memcpy(dst, buf.data() + (location - buf_start), actual);
+        location += actual;
+        return static_cast<uint32_t>(actual);
+    }
+
+    void SetLocation(duckdb::idx_t loc) override         { location = loc; }
+    duckdb::idx_t GetLocation() const override           { return location; }
+    duckdb::idx_t GetSize() const override               { return size; }
+    void Skip(duckdb::idx_t skip_count) override         { location += skip_count; }
+
+    duckdb::optional_ptr<duckdb::ReadHead> GetReadHead(duckdb::idx_t /*pos*/) override {
+        return nullptr;
+    }
+    bool HasPrefetch() const override { return false; }
+
+    void RegisterPrefetch(duckdb::idx_t pos, uint64_t /*len*/, bool /*can_merge*/ = true) override {
+        Load(pos);
+    }
+    void FinalizeRegistration() override {}
+    void Prefetch(duckdb::idx_t pos, uint64_t /*len*/) override { Load(pos); }
+    void PrefetchRegistered() override {}
+    void ClearPrefetch() override {}
+
+private:
+    // buf always ends at size; extend it back to pos in one read.
+    void Load(duckdb::idx_t pos) {
+        if (pos >= buf_start) return;
+        const duckdb::idx_t extra = buf_start - pos;
+        buf.insert(buf.begin(), extra, 0);
+        handle.inner->Read(buf.data(), extra, pos);
+        buf_start = pos;
+    }
+
+    OsvCachingFileHandle &handle;
+    duckdb::idx_t         location;
+    duckdb::idx_t         size;
+    std::vector<uint8_t>  buf;
+    duckdb::idx_t         buf_start;  // file offset of buf[0]
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SimpleFileTransport
 //
 // Minimal Thrift transport for BuildPageDirectory.  Reads sequentially from a
