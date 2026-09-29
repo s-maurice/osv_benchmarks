@@ -339,7 +339,7 @@ private:
 //
 // Reads the Parquet footer into a heap buffer through the inner file handle.
 // Used instead of the VMA, which would leave the footer's frames permanently
-// stuck in the VMA. Prefetch hints extend the buffer, so a footer takes 1-2 reads.
+// stuck in the VMA. Prefetch hints extend the buffer.
 // ─────────────────────────────────────────────────────────────────────────────
 class OsvFooterTransport
     : public duckdb_apache::thrift::transport::TVirtualTransport<OsvFooterTransport>,
@@ -382,7 +382,11 @@ private:
         if (pos >= buf_start) return;
         const duckdb::idx_t extra = buf_start - pos;
         buf.insert(buf.begin(), extra, 0);
-        handle.inner->Read(buf.data(), extra, pos);
+        // Chunk reads: OSv doesn't support more than 4 MiB in a single read call.
+        static constexpr duckdb::idx_t kMaxRead = 2 * 1024 * 1024;
+        for (duckdb::idx_t done = 0; done < extra; done += kMaxRead) {
+            handle.inner->Read(buf.data() + done, std::min(kMaxRead, extra - done), pos + done);
+        }
         buf_start = pos;
     }
 
