@@ -197,7 +197,7 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
             u64 v = pe.lock.load();
             u64 s = PageState::getState(v);
             // a reader relocked the page: drop the entry, the frame now belongs to that reader.
-            if (s == PageState::Unlocked || s == PageState::Marked) {
+            if (s == PageState::Unlocked || s == PageState::UnlockedPostReAccess || s == PageState::Marked) {
                 reread = true;
                 all_held = false;
                 break;
@@ -276,7 +276,7 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
             u64 s = PageState::getState(v);
 
             // check if we are pinned by a reader
-            if (s >= 1 && s <= PageState::MaxShared) {
+            if (PageState::isShared(s)) {
                 end_run();
                 continue;
             }
@@ -286,7 +286,7 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
             }
 
             // second chance policy, mark the PageEntry
-            if (s == PageState::Unlocked) {
+            if (s == PageState::Unlocked || s == PageState::UnlockedPostReAccess) {
                 pe.lock.tryMark(v);
                 marked = true;
                 end_run();
@@ -420,6 +420,7 @@ void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u6
             _mm_pause();
             continue;
         }
+        ucache::assert_crash(!PageState::isShared(s) || PageState::count(s) < PageState::MaxShared);
         if (PageState::getVersion(v) != PageState::getVersion(local_version)) {
             auto &pages = make_flush_pages();
             mmu::invlpg_tlb_local(pages.data(), pages.size());

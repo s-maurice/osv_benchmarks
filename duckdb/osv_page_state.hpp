@@ -9,7 +9,8 @@
 // Extracted from integrated_vmcache.cpp. No OSv kernel dependencies.
 //
 // Layout (64 bits):
-//   [63:56]  state  - Unlocked(0) / shared-count(1-252) / Locked(253) / Marked(254) / Evicted(255)
+//   [63:56]  state  - Unlocked(0) / shared-count(1-124) / Locked(253) / Marked(254) / Evicted(255)
+//                     ReAccess flag (0x80) on Unlocked / shared-count: the page was re-accessed.
 //   [55:0]   version counter - bumped via bumpVersion() or exclusive unlock (see commented-out lockX)
 
 namespace osv_duckdb {
@@ -21,7 +22,9 @@ struct PageState {
     std::atomic<u64> stateAndVersion;
 
     static const u64 Unlocked = 0;
-    static const u64 MaxShared = 252;
+    static const u64 MaxShared = 124;
+    static const u64 ReAccess = 0x80;
+    static const u64 UnlockedPostReAccess = Unlocked | ReAccess;
     static const u64 Locked = 253;
     static const u64 Marked = 254;
     static const u64 Evicted = 255;
@@ -61,9 +64,11 @@ struct PageState {
     // Caller must already hold an exclusive lock.
     void unlockXEvictedSameVersion(u64 locked_v) { stateAndVersion.store(sameVersion(locked_v, Evicted), std::memory_order_release); }
 
+    // Only Unlocked -> shared sets ReAccess, joining a held page does not.
     bool tryLockS(u64 v) {
         u64 s = getState(v);
-        if (s < MaxShared) return stateAndVersion.compare_exchange_strong(v, sameVersion(v, s+1));
+        if (s == Unlocked) return stateAndVersion.compare_exchange_strong(v, sameVersion(v, ReAccess | 1));
+        if (s < Locked && count(s) < MaxShared) return stateAndVersion.compare_exchange_strong(v, sameVersion(v, s+1));
         if (s == Marked || s == Evicted) return stateAndVersion.compare_exchange_strong(v, sameVersion(v, 1));
         return false;
     }
@@ -80,12 +85,16 @@ struct PageState {
         while (true) {
             u64 v = stateAndVersion.load();
             u64 s = getState(v);
-            assert(s > 0 && s <= MaxShared);
+            assert(isShared(s));
             if (stateAndVersion.compare_exchange_strong(v, sameVersion(v, s-1))) return;
         }
     }
 
     bool tryMark(u64 v) { return stateAndVersion.compare_exchange_strong(v, sameVersion(v, Marked)); }
+    bool tryClearReAccess(u64 v) { return stateAndVersion.compare_exchange_strong(v, sameVersion(v, Unlocked)); }
+
+    static u64 count(u64 s)     { return s & ~ReAccess; }
+    static bool isShared(u64 s) { return s < Locked && count(s) > 0; }
 
     static u64 getState(u64 v)   { return v >> 56; }
     static u64 getVersion(u64 v) { return v & ((1ULL << 56) - 1); }
