@@ -1,5 +1,6 @@
 #include "osv_ucache_file_system.hpp"
 #include "osv_parquet_file_handle.hpp"
+#include "osv_page_resident_set.hpp"
 
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/file_open_flags.hpp>
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <mutex>
 #include <numeric>
 
@@ -82,12 +84,13 @@ static std::vector<GraveyardEntry> g_eviction_graveyard;
 struct PendingUnlock { PageDirectory* dir; u32 page_idx; };
 static thread_local std::vector<PendingUnlock> t_pending_unlock;
 
-// Submits every frame covered by the PageEntry range, straddlers between pages[lo..hi]
-// included, and unlocks any page in the run that ends up with no evicted frame.
-static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo, size_t hi,
-                                 ucache::EvictList el) {
-    u64 start = dir->pages[lo].offset;
-    u64 end = dir->pages[hi].offset + (u64)dir->pages[hi].page_size();
+// Submits every frame covered by run, X-locked pages in ascending, byte-adjacent order,
+// straddlers between them included. Unlocks any page in the run that ends up with no evicted
+// frame, and appends the run positions of those unlocked into Unlocked to unlocked, if given.
+static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, const std::vector<u32>& run,
+                                 ucache::EvictList el, std::vector<u32>* unlocked) {
+    u64 start = dir->pages[run.front()].offset;
+    u64 end = dir->pages[run.back()].offset + (u64)dir->pages[run.back()].page_size();
     // Frames fully inside [start, end). A frame straddling the run's edge is shared with a
     // page we don't hold, so it isn't ours to evict.
     u64 first = start / vma->pageSize;
@@ -127,7 +130,8 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
 
     // A page with no evicted frame will never reach post_EvictedBatch (it will not be
     // submitted for eviction), so unlock it here.
-    for (size_t k = lo; k <= hi; k++) {
+    for (u32 r = 0; r < run.size(); r++) {
+        u32 k = run[r];
         PageEntry& pe = dir->pages[k];
         u64 pf_first = pe.offset / vma->pageSize;
         u64 pf_end = (pe.offset + (u64)pe.page_size() - 1) / vma->pageSize + 1;
@@ -142,12 +146,13 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, size_t lo,
 
         // todo: check if we should unlock into marked
         if (has_frame) {
-            t_pending_unlock.push_back({dir, (u32)k});
+            t_pending_unlock.push_back({dir, k});
         } else if (all_uncached || has_rejected) {
             // if all were Uncached, or the rest are in the graveyard, we can go to the Evicted state.
             pe.lock.unlockXEvictedSameVersion(pe.lock.load());
         } else {
             pe.lock.unlockXSameVersion(pe.lock.load());
+            if (unlocked) unlocked->push_back(r);
         }
     }
 
@@ -261,9 +266,14 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
         bool in_run = false;
         size_t run_lo = 0;
         size_t run_hi = 0;
+        std::vector<u32> run;
 
         auto end_run = [&]() {
-            if (in_run) evict_frames_in_run(dir, vma, run_lo, run_hi, el);
+            if (in_run) {
+                run.clear();
+                for (size_t k = run_lo; k <= run_hi; k++) run.push_back((u32)k);
+                evict_frames_in_run(dir, vma, run, el, nullptr);
+            }
             in_run = false;
         };
 
@@ -325,6 +335,105 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
         sweep();
     }
 }
+
+#if DUCKDB_PAGE_RS
+// Pops victims from the page resident set. Victim selection is global across files, so the vma
+// uCache passes in is ignored.
+static void page_rs_evict_policy(ucache::VMA* /*vma*/, u64 nbToEvict, ucache::EvictList el) {
+    using namespace page_rs;
+    static constexpr size_t kMaxPop = 64;
+
+    drain_eviction_graveyard(el);
+
+    struct Victim { Entry entry; Queue origin; };
+    Entry popped[kMaxPop];
+    // Popped entries that stay resident, per destination queue.
+    std::array<std::vector<Entry>, 2> requeue;
+    std::vector<Victim> victims;
+    std::vector<u32> run;
+    std::vector<u32> unlocked;
+
+    // Bounds the work when most resident pages are held by readers.
+    int64_t budget = 2 * (int64_t)(Size(Small) + Size(Main));
+
+    while ((u64)el.size() < nbToEvict && budget > 0) {
+        // Pop about as many pages as cover the frames still needed.
+        u64 want_frames = nbToEvict - el.size();
+        size_t to_pop = std::clamp<u64>(want_frames * mmu::page_size / AvgPageBytes() + 1, 1, kMaxPop);
+
+        Queue queue = (Size(Small) > SmallTarget() || Size(Main) == 0) ? Small : Main;
+        size_t n = PopBatch(queue, popped, to_pop);
+        if (n == 0) {
+            queue = (queue == Small) ? Main : Small;
+            n = PopBatch(queue, popped, to_pop);
+            if (n == 0) break;
+        }
+        for (size_t i = 0; i < n; i++)
+            __builtin_prefetch(&Directory(popped[i].dir_id)->pages[popped[i].page_idx]);
+
+        // Take victims until they cover the frames still needed.
+        u64 victim_frames = 0;
+        size_t i = 0;
+        for (; i < n && victim_frames < want_frames; i++, budget--) {
+            Entry entry = popped[i];
+            PageDirectory* dir = Directory(entry.dir_id);
+            PageEntry& pe = dir->pages[entry.page_idx];
+            u64 v = pe.lock.load();
+            u64 s = PageState::getState(v);
+            // We own the page's only entry, so it is resident and no other evictor holds it.
+            ucache::assert_crash(s != PageState::Locked && s != PageState::Marked && s != PageState::Evicted);
+            if (s == PageState::UnlockedPostReAccess && pe.lock.tryClearReAccess(v)) {
+                // From S: promotion, from M: reinsertion.
+                requeue[Main].push_back(entry);
+            } else if (s == PageState::Unlocked && pe.lock.tryLockX(v)) {
+                victims.push_back({entry, queue});
+                victim_frames += (pe.page_size() + dir->vma->pageSize - 1) / dir->vma->pageSize;
+            } else {
+                // Held by a reader, or we lost the race to one.
+                requeue[queue].push_back(entry);
+            }
+        }
+        UnpopBatch(queue, popped + i, n - i);
+        for (Queue q : {Small, Main}) {
+            PushBatch(q, requeue[q].data(), requeue[q].size());
+            requeue[q].clear();
+        }
+
+        // sorting globally allows for file-adjacent regions to remain adjacent, allowing them to form runs
+        std::sort(victims.begin(), victims.end(), [](const Victim& a, const Victim& b) {
+            if (a.entry.dir_id != b.entry.dir_id) return a.entry.dir_id < b.entry.dir_id;
+            return Directory(a.entry.dir_id)->pages[a.entry.page_idx].offset <
+                   Directory(b.entry.dir_id)->pages[b.entry.page_idx].offset;
+        });
+
+        // submit evictions in runs
+        for (size_t run_start = 0; run_start < victims.size();) {
+            const u32 dir_id = victims[run_start].entry.dir_id;
+            PageDirectory* dir = Directory(dir_id);
+
+            // extend the current run while we are in the same file and the next page is adjacent
+            run.clear();
+            run.push_back(victims[run_start].entry.page_idx);
+            size_t run_end = run_start + 1;
+            for (; run_end < victims.size() && victims[run_end].entry.dir_id == dir_id; run_end++) {
+                PageEntry& prev = dir->pages[run.back()];
+                if (prev.offset + (u64)prev.page_size() != dir->pages[victims[run_end].entry.page_idx].offset) break;
+                run.push_back(victims[run_end].entry.page_idx);
+            }
+
+            unlocked.clear();
+            evict_frames_in_run(dir, dir->vma, run, el, &unlocked);
+            // No frame of these pages could be submitted: they stay resident, back to their queue.
+            for (u32 r : unlocked) {
+                const Victim& victim = victims[run_start + r];
+                PushBatch(victim.origin, &victim.entry, 1);
+            }
+            run_start = run_end;
+        }
+        victims.clear();
+    }
+}
+#endif
 
 // Eviction cannot fail.
 // We already hold an exclusive lock, the PTE cannot have changed since we snapshotted it.
@@ -390,8 +499,14 @@ static void duckdb_postEvictedBatch(ucache::Buffer* const* buffers, size_t count
 // Page directory persistence
 // ─────────────────────────────────────────────────────────────────────────────
 
-// todo: push the page to the resident set
-void PageResidentSetInsert(PageDirectory * /*dir*/, u32 /*page_idx*/) {}
+void PageResidentSetInsert(PageDirectory *dir, u32 page_idx) {
+#if DUCKDB_PAGE_RS
+    page_rs::Insert({dir->dir_id, page_idx});
+#else
+    (void)dir;
+    (void)page_idx;
+#endif
+}
 
 size_t GetThreadSlot() {
     return static_cast<size_t>(sched::cpu::current()->id);
@@ -471,10 +586,25 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
 
     ucache::VMA *vma = ucache::uCacheManager->mmap(path.c_str(), 0, mmu::page_size);
     vma->options.user_data = &dir_ref;
+    dir_ref.vma = vma;
     // We can disable TLB shootdowns because we handle signaling PTE updates with PageEntries.
     vma->options.skipTLBShootdown = true;
+
+    // Records the eviction variant in the log.
+    if (page_dirs_.size() == 1) std::printf("[evict] page_rs=%d\n", DUCKDB_PAGE_RS);
+
+#if DUCKDB_PAGE_RS
+    u64 page_bytes = 0;
+    for (const PageEntry &pe : dir_ref.pages) page_bytes += pe.page_size();
+    dir_ref.dir_id = page_rs::Register(&dir_ref, num_pages, page_bytes,
+                                       ucache::uCacheManager->totalPhysSize);
+
+    ucache::uCacheManager->setEvictionPolicy(vma, page_rs_evict_policy);
+#else
     ucache::uCacheManager->setEvictionPolicy(vma, duckdb_evict_policy);
-    // We sweep dir->pages ourselves, so the resident set is never read.
+#endif
+
+    // We choose victims among PageEntries ourselves, so uCache's resident set is never read.
     static ucache::NullResidentSet null_rs;
     vma->residentSet = &null_rs;
     vma->callback_implems.canBeEvicted_implem = duckdb_canBeEvicted;

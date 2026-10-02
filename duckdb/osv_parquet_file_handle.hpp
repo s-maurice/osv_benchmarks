@@ -90,6 +90,9 @@ struct PageDirectory {
     std::vector<u32>                 offset_index;
     // Resume point for the eviction sweep.
     std::atomic<u32>                 evict_cursor{0};
+    // Set in StorePageDirectory: the file's VMA, and its id in the page resident set.
+    ucache::VMA                     *vma = nullptr;
+    u32                              dir_id = 0;
 
     // [row_group_idx] -> bloom filter PageEntry index in pages[], or NO_BLOOM_PAGE.
     static constexpr duckdb::idx_t NO_BLOOM_PAGE = ~static_cast<duckdb::idx_t>(0);
@@ -105,6 +108,8 @@ struct PageDirectory {
           thread_versions(std::move(o.thread_versions)),
           offset_index(std::move(o.offset_index)),
           evict_cursor(0),
+          vma(o.vma),
+          dir_id(o.dir_id),
           rg_bloom_page(std::move(o.rg_bloom_page)) {}
 };
 
