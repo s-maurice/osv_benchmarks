@@ -390,6 +390,9 @@ static void duckdb_postEvictedBatch(ucache::Buffer* const* buffers, size_t count
 // Page directory persistence
 // ─────────────────────────────────────────────────────────────────────────────
 
+// todo: push the page to the resident set
+void PageResidentSetInsert(PageDirectory * /*dir*/, u32 /*page_idx*/) {}
+
 size_t GetThreadSlot() {
     return static_cast<size_t>(sched::cpu::current()->id);
 }
@@ -399,7 +402,7 @@ size_t GetThreadSlot() {
 void DisableMigration() { sched::migrate_disable(); }
 void EnableMigration()  { sched::migrate_enable(); }
 
-void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size) {
+u64 lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size) {
     std::vector<void *> flush_pages;
     auto make_flush_pages = [&]() -> std::vector<void *> & {
         if (flush_pages.empty()) {
@@ -428,7 +431,7 @@ void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u6
         }
         if (ps.tryLockS(v)) {
             local_version = v;
-            return;
+            return s;
         }
         _mm_pause();
     }

@@ -46,7 +46,8 @@ struct PageDirectory;
 struct PageState;
 size_t GetThreadSlot();
 void validateFlushTlb(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
-void lockSWithFlush(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
+uint64_t lockSWithFlush(PageState &ps, uint64_t &local_version, const char *page_addr, uint64_t page_size);
+void PageResidentSetInsert(PageDirectory *dir, u32 page_idx);
 void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len);
 void DisableMigration();
 void EnableMigration();
@@ -107,6 +108,15 @@ struct PageDirectory {
           rg_bloom_page(std::move(o.rg_bloom_page)) {}
 };
 
+// S-lock pages[idx] with lockSWithFlush. The reader that makes the page resident adds it to the
+// resident set.
+inline void LockPageS(PageDirectory *dir, duckdb::idx_t idx, const char *vma_base) {
+    auto &pe = dir->pages[idx];
+    u64 prev = lockSWithFlush(pe.lock, dir->thread_versions[GetThreadSlot()][idx],
+                              vma_base + pe.offset, static_cast<u64>(pe.page_size()));
+    if (prev == PageState::Evicted) PageResidentSetInsert(dir, static_cast<u32>(idx));
+}
+
 // RAII guard for a PageState S-lock.
 // Inherits from ResizeableBuffer, meaning we support zero-copy passing into DuckDB for
 // uncompressed + unencrypted pages.
@@ -127,15 +137,13 @@ struct VmaPagePin : public duckdb::ResizeableBuffer {
     {
         ptr = reinterpret_cast<duckdb::data_ptr_t>(const_cast<char *>(vma_ptr));
         len = size + 1;  // match AllocateBlock(uncompressed_size + 1); required by ByteStreamSplitDecoder
-        u64 &local_ver = dir->thread_versions[GetThreadSlot()][page_idx];
-        auto &pe = dir->pages[page_idx];
         if (already_locked) {
             // We may have moved threads since the lock was acquired - re-validate the TLB.
-            validateFlushTlb(pe.lock, local_ver, vma_base_p + pe.offset,
-                              static_cast<u64>(pe.page_size()));
+            auto &pe = dir->pages[page_idx];
+            validateFlushTlb(pe.lock, dir->thread_versions[GetThreadSlot()][page_idx],
+                             vma_base_p + pe.offset, static_cast<u64>(pe.page_size()));
         } else {
-            lockSWithFlush(pe.lock, local_ver, vma_base_p + pe.offset,
-                           static_cast<u64>(pe.page_size()));
+            LockPageS(dir, page_idx, vma_base_p);
         }
     }
 
@@ -200,8 +208,8 @@ void validateFlushTlb(PageState &ps, u64 &local_version, const char *page_addr, 
 // if the version changed since local_version. The flush and the tryLockS CAS
 // are tied to the same observed version - if the CAS fails, the loop re-checks
 // and re-flushes if needed. On return: lock is held and local_version equals
-// the version at which the lock was acquired.
-void lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size);
+// the version at which the lock was acquired. Returns the state the lock was taken from.
+u64 lockSWithFlush(PageState &ps, u64 &local_version, const char *page_addr, u64 page_size);
 
 // Make sure we don't migrate to another core after validating our TLB entries.
 void DisableMigration();
