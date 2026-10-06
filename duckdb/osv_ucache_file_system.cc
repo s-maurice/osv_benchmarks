@@ -70,7 +70,9 @@ void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len) {
 // Eviction callbacks for DuckDB VMA
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Frames whose eviction was rejected (prefetch I/O still pending), retried at each eviction.
+// Frames that could not be evicted when their page was evicted, are retried at each eviction.
+// Some reasons for this could be: I/O was still in-flight, or the frame was a straddle-frame,
+// where the other page(s) were locked.
 // Their pages stay Evicted, so only the graveyard evicts them; dropped if a reader relocks a page.
 struct GraveyardEntry { ucache::VMA* vma; u64 frame; };
 static std::mutex g_eviction_graveyard_mu;
@@ -82,26 +84,69 @@ static std::vector<GraveyardEntry> g_eviction_graveyard;
 struct PendingUnlock { PageDirectory* dir; u32 page_idx; bool flushed_all; };
 static thread_local std::vector<PendingUnlock> t_pending_unlock;
 
-// Submits every frame covered by run, X-locked pages in ascending, byte-adjacent order,
-// straddlers between them included. Unlocks any page in the run that ends up with no evicted
-// frame, and appends the run positions of those unlocked into Unlocked to unlocked, if given.
+enum class FramePages { AllHeld, Resident, Busy };
+
+// X-locks every page overlapping frame, except those starting in [skip_start, skip_end), and
+// appends them to held. All or nothing, and only from Evicted: a frame's PTE may be cleared only
+// while every page on it is X-locked, and each of them needs a version bump afterwards.
+// Resident: a page is resident and still covers the frame. Busy: another eviction holds a page.
+static FramePages lock_frame_pages(PageDirectory* dir, ucache::VMA* vma, u64 frame,
+                                   u64 skip_start, u64 skip_end, std::vector<u32>& held) {
+    const size_t held_before = held.size();
+    u64 f_start = frame * vma->pageSize;
+    u64 f_end = f_start + vma->pageSize;
+    FramePages result = FramePages::AllHeld;
+
+    // Step 1: lock the overlapping pages in ascending offset order, stop at the first failure.
+    auto it = std::lower_bound(dir->offset_index.begin(), dir->offset_index.end(), f_start,
+        [&](u32 idx, u64 val) {
+            return dir->pages[idx].offset + (u64)dir->pages[idx].page_size() <= val;
+        });
+    for (; it != dir->offset_index.end() && dir->pages[*it].offset < f_end; ++it) {
+        PageEntry& pe = dir->pages[*it];
+        if (pe.offset >= skip_start && pe.offset < skip_end) continue;
+        u64 v = pe.lock.load();
+        u64 s = PageState::getState(v);
+        if (s == PageState::Evicted && pe.lock.tryLockX(v)) {
+            held.push_back(*it);
+            continue;
+        }
+        // Locked, or we lost the race for an Evicted page.
+        result = (s == PageState::Locked || s == PageState::Evicted) ? FramePages::Busy : FramePages::Resident;
+        break;
+    }
+
+    // Step 2: on failure release what this call locked.
+    if (result != FramePages::AllHeld) {
+        for (size_t i = held_before; i < held.size(); i++) {
+            PageState& lock = dir->pages[held[i]].lock;
+            lock.unlockXEvictedSameVersion(lock.load());
+        }
+        held.resize(held_before);
+    }
+    return result;
+}
+
+// Submits the frames of run: X-locked pages in ascending, byte-adjacent order. A frame shared
+// with pages outside the run is submitted only if those are all Evicted and can be locked, so a
+// shared frame is freed by whichever of its pages is evicted last. Every page of the run ends
+// Evicted: here if none of its frames is submitted, else in post_EvictedBatch.
 static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, const std::vector<u32>& run,
-                                 ucache::EvictList el, std::vector<u32>* unlocked) {
+                                 ucache::EvictList el) {
     u64 start = dir->pages[run.front()].offset;
     u64 end = dir->pages[run.back()].offset + (u64)dir->pages[run.back()].page_size();
-    // Frames fully inside [start, end). A frame straddling the run's edge is shared with a
-    // page we don't hold, so it isn't ours to evict.
     u64 first = start / vma->pageSize;
     u64 last = (end - 1) / vma->pageSize;
-    u64 fi = (start % vma->pageSize == 0) ? first : first + 1;
-    u64 inner_end = (end % vma->pageSize == 0) ? last + 1 : last;   // exclusive
 
-    std::vector<u64> evicted;
-    std::vector<u64> rejected;
-    const u64 fi0 = fi;
+    std::vector<u64> evicted; // ascending
+    std::vector<u64> to_graveyard;
+    // Pages outside the run, X-locked for a submitted edge frame.
+    std::vector<u32> neighbours;
 
-    for (; fi < inner_end && fi < vma->buffers.size(); fi++) {
-        ucache::Buffer* buf = vma->buffers[fi];
+    // Step 1: submit the run's frames.
+    for (u64 f = first; f <= last && f < vma->buffers.size(); f++) {
+        ucache::Buffer* buf = vma->buffers[f];
+        // Not exception safe: if we throw, we would not properly clean up `bs`.
         auto* bs = new ucache::BufferSnapshot(vma->nbPages);
         buf->updateSnapshot(bs);
 
@@ -110,56 +155,72 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, const std:
             delete bs;
             continue;
         }
-        // todo: add non-failable addEvictionCandidate
-        if (vma->addEvictionCandidateAllowUnaccessed(buf, bs, el)) {
-            evicted.push_back(fi);
-        } else {
-            delete bs;
-            rejected.push_back(fi);
+
+        // An edge frame is shared with pages outside the run, lock those first.
+        bool edge = (f == first && start % vma->pageSize != 0) || (f == last && end % vma->pageSize != 0);
+        const size_t neighbours_before = neighbours.size();
+        if (edge) {
+            FramePages others = lock_frame_pages(dir, vma, f, start, end, neighbours);
+            if (others == FramePages::Resident) {
+                delete bs;
+                continue;
+            }
+            if (others == FramePages::Busy) {
+                // both evictors would fail here, so push to graveyard to retry later
+                delete bs;
+                to_graveyard.push_back(f);
+                continue;
+            }
+            // The frame may have changed before its other pages were locked.
+            buf->updateSnapshot(bs);
         }
+
+        // Submit the frame. On success uCache owns bs.
+        bool uncached = bs->state == ucache::BufferState::Uncached;
+        if (!uncached && vma->addEvictionCandidateAllowUnaccessed(buf, bs, el)) {
+            evicted.push_back(f);
+            continue;
+        }
+
+        // Not submitted, release the pages locked for it.
+        delete bs;
+        for (size_t i = neighbours_before; i < neighbours.size(); i++) {
+            PageState& lock = dir->pages[neighbours[i]].lock;
+            lock.unlockXEvictedSameVersion(lock.load());
+        }
+        neighbours.resize(neighbours_before);
+        // Prefetch I/O still pending: the device may still write into the frame, so retry later.
+        if (!uncached) to_graveyard.push_back(f);
     }
 
-    const u64 fi_end = fi; // frames [fi0, fi_end) were attempted
+    // Step 2: queue the locked pages outside the run for unlock in post_EvictedBatch. This CPU
+    // flushes only their edge frame, so flushed_all is false.
+    for (u32 k : neighbours) t_pending_unlock.push_back({dir, k, false});
 
-    // frames are stored in ascending order
-    auto contains = [](const std::vector<u64>& v, u64 f) {
-        return std::binary_search(v.begin(), v.end(), f);
-    };
-
-    // A page with no evicted frame will never reach post_EvictedBatch (it will not be
-    // submitted for eviction), so unlock it here.
-    for (u32 r = 0; r < run.size(); r++) {
-        u32 k = run[r];
+    // Step 3: unlock the run's pages. A page with a submitted frame is unlocked in
+    // post_EvictedBatch. A page with none is unlocked here, without incrementing its version.
+    for (u32 k : run) {
         PageEntry& pe = dir->pages[k];
         u64 pf_first = pe.offset / vma->pageSize;
         u64 pf_end = (pe.offset + (u64)pe.page_size() - 1) / vma->pageSize + 1;
         u64 submitted = 0;
-        bool has_rejected = false;
         for (u64 f = pf_first; f < pf_end; f++) {
-            if (contains(evicted, f)) submitted++;
-            if (contains(rejected, f)) has_rejected = true;
+            if (std::binary_search(evicted.begin(), evicted.end(), f)) submitted++;
         }
-        // every frame attempted, none evicted or rejected: all were Uncached
-        bool has_frame = submitted > 0;
-        bool all_uncached = !has_frame && !has_rejected && pf_first >= fi0 && pf_end <= fi_end;
 
-        // todo: check if we should unlock into marked
-        if (has_frame) {
+        if (submitted > 0) {
             t_pending_unlock.push_back({dir, k, submitted == pf_end - pf_first});
-        } else if (all_uncached || has_rejected) {
-            // if all were Uncached, or the rest are in the graveyard, we can go to the Evicted state.
-            pe.lock.unlockXEvictedSameVersion(pe.lock.load());
         } else {
-            pe.lock.unlockXSameVersion(pe.lock.load());
-            if (unlocked) unlocked->push_back(r);
+            // No frame of this page is being evicted: each is Uncached, left to a resident page
+            // that shares it, or in the graveyard. No PTE changed, so the version stays.
+            pe.lock.unlockXEvictedSameVersion(pe.lock.load());
         }
     }
 
-    if (!rejected.empty()) {
-        // Prefetch I/O still pending: the device may still write into the frame, so retry later.
-        std::printf("[evict] %zu frame(s) not evicted\n", rejected.size());
+    // Step 4: add graveyarded frames into the graveyard.
+    if (!to_graveyard.empty()) {
         std::scoped_lock lk(g_eviction_graveyard_mu);
-        for (u64 f : rejected) g_eviction_graveyard.push_back({vma, f});
+        for (u64 f : to_graveyard) g_eviction_graveyard.push_back({vma, f});
     }
 }
 
@@ -174,84 +235,61 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
         to_retry.swap(g_eviction_graveyard);
     }
 
+    // Step 1: drop duplicates. Two evictions can send the same frame.
+    std::sort(to_retry.begin(), to_retry.end(), [](const GraveyardEntry& a, const GraveyardEntry& b) {
+        return a.vma != b.vma ? a.vma < b.vma : a.frame < b.frame;
+    });
+    to_retry.erase(std::unique(to_retry.begin(), to_retry.end(), [](const GraveyardEntry& a, const GraveyardEntry& b) {
+        return a.vma == b.vma && a.frame == b.frame;
+    }), to_retry.end());
+
     std::vector<u32> held;
     std::vector<GraveyardEntry> requeue;
 
+    // Step 2: retry each frame.
     for (const GraveyardEntry& e : to_retry) {
         ucache::VMA* vma = e.vma;
         auto* dir = static_cast<PageDirectory*>(vma->options.user_data);
         if (!dir || e.frame >= vma->buffers.size()) continue;
 
-        u64 f_start = e.frame * vma->pageSize;
-        u64 f_end = f_start + vma->pageSize;
-
-        // Lock every PageEntry overlapping the frame, all-or-nothing, in ascending offset
-        // order so concurrent drains cannot deadlock.
-        // Graveyard pages are Evicted. We need to take X lock on all pages, and signal TLB
-        // invalidation with version bump.
+        // Lock every page on the frame.
         held.clear();
-        bool all_held = true;
-        bool reread = false;
-        auto it = std::lower_bound(dir->offset_index.begin(), dir->offset_index.end(), f_start,
-            [&](u32 idx, u64 val) {
-                return dir->pages[idx].offset + (u64)dir->pages[idx].page_size() <= val;
-            });
-        for (; it != dir->offset_index.end() && dir->pages[*it].offset < f_end; ++it) {
-            PageEntry& pe = dir->pages[*it];
-            u64 v = pe.lock.load();
-            u64 s = PageState::getState(v);
-            // a reader relocked the page: drop the entry, the frame now belongs to that reader.
-            if (s == PageState::Unlocked || s == PageState::UnlockedPostReAccess || s == PageState::Marked) {
-                reread = true;
-                all_held = false;
-                break;
-            }
-            // A shared count means a reader is inside the page, Locked means another evictor
-            // owns it. Either way the frame is not ours this round.
-            if (s != PageState::Evicted || !pe.lock.tryLockX(v)) {
-                all_held = false;
-                break;
-            }
-            held.push_back(*it);
-        }
-
-        bool evicted = false;
-        bool nothing_left = false;
-        if (all_held) {
-            ucache::Buffer* buf = vma->buffers[e.frame];
-            auto* bs = new ucache::BufferSnapshot(vma->nbPages);
-            buf->updateSnapshot(bs);
-            if (bs->state == ucache::BufferState::Uncached) {
-                // Already freed (or never loaded): nothing to evict, and retrying would
-                // fail forever (CachedToEvicting refuses Uncached frames).
-                delete bs;
-                nothing_left = true;
-            } else {
-                evicted = vma->addEvictionCandidateAllowUnaccessed(buf, bs, el);
-                if (!evicted) delete bs;
-            }
-        }
-
-        if (evicted) {
-            for (u32 pi : held)
-                t_pending_unlock.push_back({dir, pi, false});
-        } else if (nothing_left || reread) {
-            for (u32 pi : held)
-                dir->pages[pi].lock.unlockXEvictedSameVersion(dir->pages[pi].lock.load());
-        } else {
-            for (u32 pi : held)
-                dir->pages[pi].lock.unlockXEvictedSameVersion(dir->pages[pi].lock.load());
+        FramePages pages = lock_frame_pages(dir, vma, e.frame, 0, 0, held);
+        // A reader relocked a page: drop the entry, that page covers the frame again.
+        if (pages == FramePages::Resident) continue;
+        // Another eviction holds a page, which will end up Evicted: retry later.
+        if (pages == FramePages::Busy) {
             requeue.push_back(e);
+            continue;
         }
+
+        // Submit the frame. On success uCache owns bs.
+        ucache::Buffer* buf = vma->buffers[e.frame];
+        // Not exception safe; if we throw, we would not properly clean up `bs`.
+        auto* bs = new ucache::BufferSnapshot(vma->nbPages);
+        buf->updateSnapshot(bs);
+        // An Uncached frame is already freed, so the entry is dropped.
+        bool uncached = bs->state == ucache::BufferState::Uncached;
+        if (!uncached && vma->addEvictionCandidateAllowUnaccessed(buf, bs, el)) {
+            for (u32 pi : held) t_pending_unlock.push_back({dir, pi, false});
+            continue;
+        }
+
+        // Not submitted, release the locks without incrementing the versions.
+        delete bs;
+        for (u32 pi : held)
+            dir->pages[pi].lock.unlockXEvictedSameVersion(dir->pages[pi].lock.load());
+        if (!uncached) requeue.push_back(e);
     }
 
+    // Step 3: keep the frames that are still not evictable for the next drain.
     if (!requeue.empty()) {
         std::scoped_lock lk(g_eviction_graveyard_mu);
         g_eviction_graveyard.insert(g_eviction_graveyard.end(), requeue.begin(), requeue.end());
     }
 }
 
-static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el) {
+[[maybe_unused]] static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el) {
     drain_eviction_graveyard(el);
 
     auto* dir = static_cast<PageDirectory*>(vma->options.user_data);
@@ -271,7 +309,7 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
             if (in_run) {
                 run.clear();
                 for (size_t k = run_lo; k <= run_hi; k++) run.push_back((u32)k);
-                evict_frames_in_run(dir, vma, run, el, nullptr);
+                evict_frames_in_run(dir, vma, run, el);
             }
             in_run = false;
         };
@@ -350,7 +388,6 @@ static void page_rs_evict_policy(ucache::VMA* /*vma*/, u64 nbToEvict, ucache::Ev
     std::array<std::vector<Entry>, 2> requeue;
     std::vector<Victim> victims;
     std::vector<u32> run;
-    std::vector<u32> unlocked;
 
     // Bounds the work when most resident pages are held by readers.
     int64_t budget = 2 * (int64_t)(Size(Small) + Size(Main));
@@ -420,13 +457,7 @@ static void page_rs_evict_policy(ucache::VMA* /*vma*/, u64 nbToEvict, ucache::Ev
                 run.push_back(victims[run_end].entry.page_idx);
             }
 
-            unlocked.clear();
-            evict_frames_in_run(dir, dir->vma, run, el, &unlocked);
-            // No frame of these pages could be submitted: they stay resident, back to their queue.
-            for (u32 r : unlocked) {
-                const Victim& victim = victims[run_start + r];
-                PushBatch(victim.origin, &victim.entry, 1);
-            }
+            evict_frames_in_run(dir, dir->vma, run, el);
             run_start = run_end;
         }
         victims.clear();
