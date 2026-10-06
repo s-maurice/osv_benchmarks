@@ -77,7 +77,9 @@ static std::mutex g_eviction_graveyard_mu;
 static std::vector<GraveyardEntry> g_eviction_graveyard;
 
 // Vector containing the currently held page locks for eviction.
-struct PendingUnlock { PageDirectory* dir; u32 page_idx; };
+// flushed_all: this eviction submits every frame of the page, so the evicting CPU flushes all
+// of the page's TLB entries and can skip that flush on its next lock of the page.
+struct PendingUnlock { PageDirectory* dir; u32 page_idx; bool flushed_all; };
 static thread_local std::vector<PendingUnlock> t_pending_unlock;
 
 // Submits every frame covered by run, X-locked pages in ascending, byte-adjacent order,
@@ -131,18 +133,19 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, const std:
         PageEntry& pe = dir->pages[k];
         u64 pf_first = pe.offset / vma->pageSize;
         u64 pf_end = (pe.offset + (u64)pe.page_size() - 1) / vma->pageSize + 1;
-        bool has_frame = false;
+        u64 submitted = 0;
         bool has_rejected = false;
         for (u64 f = pf_first; f < pf_end; f++) {
-            if (contains(evicted, f)) has_frame = true;
+            if (contains(evicted, f)) submitted++;
             if (contains(rejected, f)) has_rejected = true;
         }
         // every frame attempted, none evicted or rejected: all were Uncached
+        bool has_frame = submitted > 0;
         bool all_uncached = !has_frame && !has_rejected && pf_first >= fi0 && pf_end <= fi_end;
 
         // todo: check if we should unlock into marked
         if (has_frame) {
-            t_pending_unlock.push_back({dir, k});
+            t_pending_unlock.push_back({dir, k, submitted == pf_end - pf_first});
         } else if (all_uncached || has_rejected) {
             // if all were Uncached, or the rest are in the graveyard, we can go to the Evicted state.
             pe.lock.unlockXEvictedSameVersion(pe.lock.load());
@@ -231,7 +234,7 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
 
         if (evicted) {
             for (u32 pi : held)
-                t_pending_unlock.push_back({dir, pi});
+                t_pending_unlock.push_back({dir, pi, false});
         } else if (nothing_left || reread) {
             for (u32 pi : held)
                 dir->pages[pi].lock.unlockXEvictedSameVersion(dir->pages[pi].lock.load());
@@ -459,8 +462,8 @@ static void duckdb_postEvictedBatch(ucache::Buffer* const* buffers, size_t count
 
         // Optimisation: skip the redundant version check and TLB flush that
         // lockSWithFlush/validateFlushTlb would otherwise fire on this CPU's
-        // next read of the page.
-        dir->thread_versions[GetThreadSlot()][p.page_idx] = new_v;
+        // next read of the page. Only valid if we actually flushed every frame on this page.
+        if (p.flushed_all) dir->thread_versions[GetThreadSlot()][p.page_idx] = new_v;
     }
     t_pending_unlock.resize(keep);
 
