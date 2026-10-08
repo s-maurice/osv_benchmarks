@@ -2,9 +2,9 @@
 
 // Ablation switches. A build is one step; each step adds one concept to the steps before it.
 //   1 base      DuckDB's parquet reader on plain uCache: frame eviction, TLB shootdown by IPI
-//   2 pages     readers lock PageEntries, eviction picks pages (sweep over dir->pages)
-//   3 queues    eviction pops pages from the page resident set (S/M FIFO)
-//   4 prefetch  pages are prefetched when they are locked
+//   2 prefetch  column chunks are prefetched before they are read
+//   3 pages     readers lock PageEntries, eviction picks pages (sweep over dir->pages)
+//   4 queues    eviction pops pages from the page resident set (S/M FIFO)
 //   5 noipi     no TLB shootdown IPIs, a CPU flushes by page version on its next lock
 //   6 full      pages are read and decompressed straight from the VMA, without a copy
 //
@@ -22,18 +22,18 @@
 #endif
 
 // Each switch can also be set by itself in osv_ablation_variant.hpp.
+#ifndef DUCKDB_PREFETCH
+#define DUCKDB_PREFETCH (DUCKDB_ABLATION_STEP >= 2)
+#endif
 #ifndef DUCKDB_PAGE_LOCKS
-#define DUCKDB_PAGE_LOCKS (DUCKDB_ABLATION_STEP >= 2)
+#define DUCKDB_PAGE_LOCKS (DUCKDB_ABLATION_STEP >= 3)
 #endif
 #ifndef DUCKDB_PAGE_EVICT
-#define DUCKDB_PAGE_EVICT (DUCKDB_ABLATION_STEP >= 2)
+#define DUCKDB_PAGE_EVICT (DUCKDB_ABLATION_STEP >= 3)
 #endif
 // 0 = sweep over dir->pages, 1 = page resident set.
 #ifndef DUCKDB_PAGE_RS
-#define DUCKDB_PAGE_RS (DUCKDB_ABLATION_STEP >= 3)
-#endif
-#ifndef DUCKDB_PREFETCH
-#define DUCKDB_PREFETCH (DUCKDB_ABLATION_STEP >= 4)
+#define DUCKDB_PAGE_RS (DUCKDB_ABLATION_STEP >= 4)
 #endif
 #ifndef DUCKDB_NO_TLB_SHOOTDOWN
 #define DUCKDB_NO_TLB_SHOOTDOWN (DUCKDB_ABLATION_STEP >= 5)
@@ -48,10 +48,9 @@
 #if DUCKDB_PAGE_RS && !DUCKDB_PAGE_EVICT
 #error "the page resident set needs DUCKDB_PAGE_EVICT"
 #endif
-// uCache's own policy never evicts a prefetched frame that was not accessed.
-#if DUCKDB_PREFETCH && !DUCKDB_PAGE_EVICT
-#error "prefetch needs DUCKDB_PAGE_EVICT"
-#endif
+// Note: with DUCKDB_PREFETCH and without DUCKDB_PAGE_EVICT (step 2), a prefetched frame that is
+// never read stays in the cache, as uCache's own policy does not evict it.
+
 // Without page eviction nothing bumps the page versions the lazy flush relies on.
 #if DUCKDB_NO_TLB_SHOOTDOWN && !DUCKDB_PAGE_EVICT
 #error "skipping the TLB shootdown needs DUCKDB_PAGE_EVICT"
