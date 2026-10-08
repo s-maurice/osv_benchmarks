@@ -27,6 +27,9 @@ namespace osv_duckdb {
 // and simply polls for completion rather than starting a new synchronous read.
 // ─────────────────────────────────────────────────────────────────────────────
 void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len) {
+#if !DUCKDB_PREFETCH
+    (void)vma; (void)pos; (void)len;
+#else
     if (len == 0 || ucache::uCacheManager == nullptr) return;
 
     // Count total in-flight prefetch IOs across all CPUs to avoid saturating the
@@ -63,6 +66,7 @@ void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len) {
         ucache::uCacheManager->ensureFreePages(vma->pageSize * pl.size());
         ucache::uCacheManager->prefetch(vma, pl);
     }
+#endif
 }
 
 
