@@ -636,7 +636,7 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
 
 #if DUCKDB_PAGE_EVICT
     // We can disable TLB shootdowns because we handle signaling PTE updates with PageEntries.
-    vma->options.skipTLBShootdown = true;
+    vma->options.skipTLBShootdown = DUCKDB_NO_TLB_SHOOTDOWN;
 
 #if DUCKDB_PAGE_RS
     u64 page_bytes = 0;
