@@ -74,6 +74,8 @@ void enqueue_prefetch(ucache::VMA *vma, duckdb::idx_t pos, duckdb::idx_t len) {
 // Eviction callbacks for DuckDB VMA
 // ─────────────────────────────────────────────────────────────────────────────
 
+#if DUCKDB_PAGE_EVICT
+
 // Frames that could not be evicted when their page was evicted, are retried at each eviction.
 // Some reasons for this could be: I/O was still in-flight, or the frame was a straddle-frame,
 // where the other page(s) were locked.
@@ -293,7 +295,8 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
     }
 }
 
-[[maybe_unused]] static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el) {
+#if !DUCKDB_PAGE_RS
+static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictList el) {
     drain_eviction_graveyard(el);
 
     auto* dir = static_cast<PageDirectory*>(vma->options.user_data);
@@ -377,7 +380,7 @@ static void drain_eviction_graveyard(ucache::EvictList el) {
     }
 }
 
-#if DUCKDB_PAGE_RS
+#else
 // Pops victims from the page resident set. Victim selection is global across files, so the vma
 // uCache passes in is ignored.
 static void page_rs_evict_policy(ucache::VMA* /*vma*/, u64 nbToEvict, ucache::EvictList el) {
@@ -528,6 +531,7 @@ static void duckdb_postEvictedBatch(ucache::Buffer* const* buffers, size_t count
     //     next = k;
     // }
 }
+#endif // DUCKDB_PAGE_EVICT
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Page directory persistence
@@ -621,8 +625,6 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
     ucache::VMA *vma = ucache::uCacheManager->mmap(path.c_str(), 0, mmu::page_size);
     vma->options.user_data = &dir_ref;
     dir_ref.vma = vma;
-    // We can disable TLB shootdowns because we handle signaling PTE updates with PageEntries.
-    vma->options.skipTLBShootdown = true;
 
     // Records the ablation variant in the log.
     if (page_dirs_.size() == 1) {
@@ -631,6 +633,10 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
                     DUCKDB_ABLATION_STEP, DUCKDB_PAGE_LOCKS, DUCKDB_PAGE_EVICT, DUCKDB_PAGE_RS,
                     DUCKDB_PREFETCH, DUCKDB_NO_TLB_SHOOTDOWN, DUCKDB_ZERO_COPY);
     }
+
+#if DUCKDB_PAGE_EVICT
+    // We can disable TLB shootdowns because we handle signaling PTE updates with PageEntries.
+    vma->options.skipTLBShootdown = true;
 
 #if DUCKDB_PAGE_RS
     u64 page_bytes = 0;
@@ -648,6 +654,8 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
     vma->residentSet = &null_rs;
     vma->callback_implems.canBeEvicted_implem = duckdb_canBeEvicted;
     vma->callback_implems.post_EvictedBatch_callback_implem = duckdb_postEvictedBatch;
+#endif
+    // Without DUCKDB_PAGE_EVICT the vma keeps uCache's own frame eviction and TLB shootdown.
 
     return &dir_ref;
 }
