@@ -117,10 +117,23 @@ struct PageDirectory {
 // S-lock pages[idx] with lockSWithFlush. The reader that makes the page resident adds it to the
 // resident set.
 inline void LockPageS(PageDirectory *dir, duckdb::idx_t idx, const char *vma_base) {
+#if DUCKDB_PAGE_LOCKS
     auto &pe = dir->pages[idx];
     u64 prev = lockSWithFlush(pe.lock, dir->thread_versions[GetThreadSlot()][idx],
                               vma_base + pe.offset, static_cast<u64>(pe.page_size()));
     if (prev == PageState::Evicted) PageResidentSetInsert(dir, static_cast<u32>(idx));
+#else
+    (void)dir; (void)idx; (void)vma_base;
+#endif
+}
+
+// Releases the S-lock taken by LockPageS.
+inline void UnlockPageS(PageDirectory *dir, duckdb::idx_t idx) {
+#if DUCKDB_PAGE_LOCKS
+    dir->pages[idx].lock.unlockS();
+#else
+    (void)dir; (void)idx;
+#endif
 }
 
 // RAII guard for a PageState S-lock.
@@ -143,6 +156,7 @@ struct VmaPagePin : public duckdb::ResizeableBuffer {
     {
         ptr = reinterpret_cast<duckdb::data_ptr_t>(const_cast<char *>(vma_ptr));
         len = size + 1;  // match AllocateBlock(uncompressed_size + 1); required by ByteStreamSplitDecoder
+#if DUCKDB_PAGE_LOCKS
         if (already_locked) {
             // We may have moved threads since the lock was acquired - re-validate the TLB.
             auto &pe = dir->pages[page_idx];
@@ -151,10 +165,13 @@ struct VmaPagePin : public duckdb::ResizeableBuffer {
         } else {
             LockPageS(dir, page_idx, vma_base_p);
         }
+#else
+        (void)vma_base_p;
+#endif
     }
 
     ~VmaPagePin() {
-        if (owns_lock) dir->pages[page_idx].lock.unlockS();
+        if (owns_lock) UnlockPageS(dir, page_idx);
     }
 
     void Prefetch(ucache::VMA *vma) {
