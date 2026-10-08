@@ -620,8 +620,13 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
     // We can disable TLB shootdowns because we handle signaling PTE updates with PageEntries.
     vma->options.skipTLBShootdown = true;
 
-    // Records the eviction variant in the log.
-    if (page_dirs_.size() == 1) std::printf("[evict] page_rs=%d\n", DUCKDB_PAGE_RS);
+    // Records the ablation variant in the log.
+    if (page_dirs_.size() == 1) {
+        std::printf("[ablation] step=%d page_locks=%d page_evict=%d page_rs=%d prefetch=%d "
+                    "no_tlb_shootdown=%d zero_copy=%d\n",
+                    DUCKDB_ABLATION_STEP, DUCKDB_PAGE_LOCKS, DUCKDB_PAGE_EVICT, DUCKDB_PAGE_RS,
+                    DUCKDB_PREFETCH, DUCKDB_NO_TLB_SHOOTDOWN, DUCKDB_ZERO_COPY);
+    }
 
 #if DUCKDB_PAGE_RS
     u64 page_bytes = 0;

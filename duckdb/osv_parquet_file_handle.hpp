@@ -31,6 +31,7 @@
 #include <duckdb/common/atomic.hpp>
 #include "resizable_buffer.hpp"
 #include "osv_page_state.hpp"
+#include "osv_ablation.hpp"
 
 // ── Forward-declare OSv kernel types ──────────────────────────────────────────
 // Only used as pointers; no kernel headers pulled in.

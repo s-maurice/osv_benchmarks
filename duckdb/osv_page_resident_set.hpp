@@ -2,10 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// Eviction policy, set by the justfile: 0 = sweep over dir->pages, 1 = page resident set.
-#ifndef DUCKDB_PAGE_RS
-#define DUCKDB_PAGE_RS 1
-#endif
+#include "osv_ablation.hpp"
 
 namespace osv_duckdb {
 
