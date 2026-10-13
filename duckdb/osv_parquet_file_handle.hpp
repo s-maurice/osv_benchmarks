@@ -56,20 +56,20 @@ void EnableMigration();
 // Per-file page index. Built once during metadata load.
 struct PageEntry {
     duckdb::idx_t  offset;       // byte offset of page header in file
-    duckdb::idx_t  header_size;  // serialised Thrift header size
-    duckdb::idx_t  body_size;    // compressed page body size
+    // duckdb::idx_t  header_size;  // serialised Thrift header size
+    duckdb::idx_t  body_size;    // page size: Thrift header + compressed page body
     PageState      lock;
 
-    duckdb::idx_t  page_size() const { return header_size + body_size; }
+    duckdb::idx_t  page_size() const { return body_size; }
 
     PageEntry(duckdb::idx_t off, duckdb::idx_t hdr_sz, duckdb::idx_t body_sz)
-        : offset(off), header_size(hdr_sz), body_size(body_sz)
+        : offset(off), body_size(hdr_sz + body_sz)
     {
         lock.stateAndVersion.store(PageState::sameVersion(0, PageState::Evicted),
                                     std::memory_order_relaxed); // Evicted, version 0
     }
     PageEntry(PageEntry &&o) noexcept
-        : offset(o.offset), header_size(o.header_size), body_size(o.body_size)
+        : offset(o.offset), body_size(o.body_size)
     {
         lock.stateAndVersion.store(o.lock.stateAndVersion.load(), std::memory_order_relaxed);
     }
