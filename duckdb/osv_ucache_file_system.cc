@@ -133,6 +133,7 @@ static FramePages lock_frame_pages(PageDirectory* dir, ucache::VMA* vma, u64 fra
     return result;
 }
 
+#if !DUCKDB_KEEP_HEADER_FRAMES
 // Submits the frames of run: X-locked pages in ascending, byte-adjacent order. A frame shared
 // with pages outside the run is submitted only if those are all Evicted and can be locked, so a
 // shared frame is freed by whichever of its pages is evicted last. Every page of the run ends
@@ -230,6 +231,67 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, const std:
     }
 }
 
+#else
+// Like evict_frames_in_run, but submits only the inner frames of each page.
+// Header frames and frames which are shared with other pages are not evicted.
+static void evict_inner_frames_in_run(PageDirectory* dir, ucache::VMA* vma, const std::vector<u32>& run,
+                                       ucache::EvictList el) {
+    std::vector<u64> to_graveyard;
+
+    for (u32 k : run) {
+        PageEntry& pe = dir->pages[k];
+        u64 inner_first = pe.offset / vma->pageSize + 1;
+        u64 inner_end = std::min<u64>((pe.offset + (u64)pe.page_size()) / vma->pageSize, vma->buffers.size());
+
+        // Step 1: submit the page's inner frames.
+        u64 submitted = 0;
+        for (u64 f = inner_first; f < inner_end; f++) {
+            ucache::Buffer* buf = vma->buffers[f];
+            // Not exception safe: if we throw, we would not properly clean up `bs`.
+            auto* bs = new ucache::BufferSnapshot(vma->nbPages);
+            buf->updateSnapshot(bs);
+            if (bs->state == ucache::BufferState::Uncached) {
+                delete bs;
+                continue;
+            }
+
+            // On success uCache owns bs.
+            if (vma->addEvictionCandidateAllowUnaccessed(buf, bs, el)) {
+                submitted++;
+                continue;
+            }
+            delete bs;
+            // Prefetch I/O still pending: the device may still write into the frame, so retry later.
+            to_graveyard.push_back(f);
+        }
+
+        // Step 2: unlock the page, in post_EvictedBatch if a frame was submitted. The PTEs of the
+        // kept frames never change, so submitting every inner frame flushes all of the page.
+        if (submitted > 0) {
+            t_pending_unlock.push_back({dir, k, submitted == inner_end - inner_first});
+        } else {
+            pe.lock.unlockXEvictedSameVersion(pe.lock.load());
+        }
+    }
+
+    // Step 3: add graveyarded frames into the graveyard.
+    if (!to_graveyard.empty()) {
+        std::scoped_lock lk(g_eviction_graveyard_mu);
+        for (u64 f : to_graveyard) g_eviction_graveyard.push_back({vma, f});
+    }
+}
+#endif
+
+// Submits the frames of a run of victim pages, through the variant this build uses.
+static void evict_run(PageDirectory* dir, ucache::VMA* vma, const std::vector<u32>& run,
+                      ucache::EvictList el) {
+#if DUCKDB_KEEP_HEADER_FRAMES
+    evict_inner_frames_in_run(dir, vma, run, el);
+#else
+    evict_frames_in_run(dir, vma, run, el);
+#endif
+}
+
 // Retries frames left in g_eviction_graveyard by an earlier evict_frames_in_run call. Global
 // and VMA-independent: any CPU's eviction call, for any file, can drain it.
 static void drain_eviction_graveyard(ucache::EvictList el) {
@@ -316,7 +378,7 @@ static void duckdb_evict_policy(ucache::VMA* vma, u64 nbToEvict, ucache::EvictLi
             if (in_run) {
                 run.clear();
                 for (size_t k = run_lo; k <= run_hi; k++) run.push_back((u32)k);
-                evict_frames_in_run(dir, vma, run, el);
+                evict_run(dir, vma, run, el);
             }
             in_run = false;
         };
@@ -464,7 +526,7 @@ static void page_rs_evict_policy(ucache::VMA* /*vma*/, u64 nbToEvict, ucache::Ev
                 run.push_back(victims[run_end].entry.page_idx);
             }
 
-            evict_frames_in_run(dir, dir->vma, run, el);
+            evict_run(dir, dir->vma, run, el);
             run_start = run_end;
         }
         victims.clear();
@@ -629,9 +691,10 @@ PageDirectory *OsvUCacheFileSystem::StorePageDirectory(const duckdb::string &pat
     // Records the ablation variant in the log.
     if (page_dirs_.size() == 1) {
         std::printf("[ablation] step=%d page_locks=%d page_evict=%d page_rs=%d prefetch=%d "
-                    "no_tlb_shootdown=%d zero_copy=%d\n",
+                    "no_tlb_shootdown=%d zero_copy=%d keep_header_frames=%d\n",
                     DUCKDB_ABLATION_STEP, DUCKDB_PAGE_LOCKS, DUCKDB_PAGE_EVICT, DUCKDB_PAGE_RS,
-                    DUCKDB_PREFETCH, DUCKDB_NO_TLB_SHOOTDOWN, DUCKDB_ZERO_COPY);
+                    DUCKDB_PREFETCH, DUCKDB_NO_TLB_SHOOTDOWN, DUCKDB_ZERO_COPY,
+                    DUCKDB_KEEP_HEADER_FRAMES);
     }
 
 #if DUCKDB_PAGE_EVICT
