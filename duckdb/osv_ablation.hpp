@@ -41,8 +41,9 @@
 #ifndef DUCKDB_ZERO_COPY
 #define DUCKDB_ZERO_COPY (DUCKDB_ABLATION_STEP >= 6)
 #endif
-// Not an ablation step: eviction submits only the inner frames of a page, so the frame holding
-// its header, and a frame shared with another page, stay resident.
+// Not an ablation step: the number of leading frames of each page that eviction keeps resident,
+// starting with the frame holding its header. A frame shared with the next page stays resident
+// too. 0 evicts every frame.
 #ifndef DUCKDB_KEEP_HEADER_FRAMES
 #define DUCKDB_KEEP_HEADER_FRAMES 0
 #endif

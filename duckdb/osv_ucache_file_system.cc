@@ -232,15 +232,16 @@ static void evict_frames_in_run(PageDirectory* dir, ucache::VMA* vma, const std:
 }
 
 #else
-// Like evict_frames_in_run, but submits only the inner frames of each page.
-// Header frames and frames which are shared with other pages are not evicted.
+// Like evict_frames_in_run, but submits only the inner frames of each page: those after its
+// first DUCKDB_KEEP_HEADER_FRAMES frames, which hold its header. Frames which are shared with
+// other pages are not evicted.
 static void evict_inner_frames_in_run(PageDirectory* dir, ucache::VMA* vma, const std::vector<u32>& run,
                                        ucache::EvictList el) {
     std::vector<u64> to_graveyard;
 
     for (u32 k : run) {
         PageEntry& pe = dir->pages[k];
-        u64 inner_first = pe.offset / vma->pageSize + 1;
+        u64 inner_first = pe.offset / vma->pageSize + DUCKDB_KEEP_HEADER_FRAMES;
         u64 inner_end = std::min<u64>((pe.offset + (u64)pe.page_size()) / vma->pageSize, vma->buffers.size());
 
         // Step 1: submit the page's inner frames.
